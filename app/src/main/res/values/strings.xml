@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PendulumApp</string>
+    <string name="select_video">Select Video</string>
+    <string name="start">Start</string>
+    <string name="pause">Pause</string>
+    <string name="stop">Stop</string>
+    <string name="status_idle">Status: Idle</string>
+    <string name="status_detecting">Status: Detecting motion…</string>
+    <string name="status_paused">Status: Paused</string>
+    <string name="video_selected">Video selected</string>
+    <string name="select_video_first">Please select a video first</string>
+</resources>
