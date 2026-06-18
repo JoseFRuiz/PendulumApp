@@ -95,9 +95,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun onMotionDetected() {
         if (currentState == DetectionState.DETECTING && videoUri != null) {
-            if (!binding.videoView.isPlaying) {
-                binding.videoView.start()
-            }
+            binding.videoView.seekTo(0)
+            binding.videoView.start()
         }
     }
 

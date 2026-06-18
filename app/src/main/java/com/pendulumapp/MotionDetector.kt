@@ -5,7 +5,7 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
-import kotlin.math.sqrt
+import kotlin.math.abs
 
 class MotionDetector(
     context: Context,
@@ -16,6 +16,7 @@ class MotionDetector(
     companion object {
         const val DEFAULT_THRESHOLD = 2.0f
         private const val WARMUP_EVENTS = 10
+        private const val COOLDOWN_MS = 500L
     }
 
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -27,9 +28,11 @@ class MotionDetector(
     private val alpha = 0.8f
 
     private var warmupCount = 0
+    private var lastTriggerTime = 0L
 
     fun startListening() {
         warmupCount = 0
+        lastTriggerTime = 0L
         gravityX = 0f
         gravityY = 0f
         gravityZ = 0f
@@ -60,10 +63,16 @@ class MotionDetector(
         val linearY = y - gravityY
         val linearZ = z - gravityZ
 
-        val magnitude = sqrt(linearX * linearX + linearY * linearY + linearZ * linearZ)
+        val isLeftToRight = linearX > threshold
+                && linearX > abs(linearY)
+                && linearX > abs(linearZ)
 
-        if (magnitude > threshold) {
-            onMotionDetected()
+        if (isLeftToRight) {
+            val now = System.currentTimeMillis()
+            if (now - lastTriggerTime > COOLDOWN_MS) {
+                lastTriggerTime = now
+                onMotionDetected()
+            }
         }
     }
 
