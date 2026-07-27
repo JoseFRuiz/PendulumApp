@@ -1,0 +1,65 @@
+import argparse
+import cv2
+import os
+
+VIDEO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "baile_pendulo_modified_pendulum.mp4")
+
+parser = argparse.ArgumentParser(description="Play baile_pendulo_colored.mp4 at variable speed.")
+parser.add_argument("rate", nargs="?", type=float, default=1.0,
+                    help="Playback speed rate (default 1.0; e.g. 0.9=slower, 1.1=faster)")
+args = parser.parse_args()
+rate = max(0.01, args.rate)
+
+cap = cv2.VideoCapture(VIDEO_FILE)
+if not cap.isOpened():
+    raise FileNotFoundError(f"Could not open video: {VIDEO_FILE}")
+
+fps = cap.get(cv2.CAP_PROP_FPS) or 30
+# Display period stays fixed; speed is controlled by how fast virtual_pos advances
+delay = max(1, int(1000 / fps))
+
+# Bootstrap: pre-read first two source frames
+ret, frame_a = cap.read()
+if not ret:
+    cap.release()
+    raise RuntimeError("Video is empty")
+
+ret, frame_b = cap.read()
+if not ret:
+    frame_b = None
+next_src_idx = 1  # frame_b is at this index; frame_a is at next_src_idx - 1
+
+virtual_pos = 0.0  # real-valued position in source-frame space
+done = False
+while not done:
+    src_int = int(virtual_pos)
+    alpha = virtual_pos - src_int  # fractional part → blend weight toward frame_b
+
+    # Advance the source window until frame_a is at src_int
+    while next_src_idx - 1 < src_int:
+        if frame_b is None:
+            done = True
+            break
+        frame_a = frame_b
+        ret, frame_b = cap.read()
+        if not ret:
+            frame_b = None
+        next_src_idx += 1
+
+    if done:
+        break
+
+    # Blend frame_a and frame_b when the virtual position falls between them
+    if alpha > 0 and frame_b is not None:
+        display = cv2.addWeighted(frame_a, 1.0 - alpha, frame_b, alpha, 0)
+    else:
+        display = frame_a
+
+    cv2.imshow("baile_pendulo", display)
+    if cv2.waitKey(delay) & 0xFF == ord("q"):
+        break
+
+    virtual_pos += rate
+
+cap.release()
+cv2.destroyAllWindows()
