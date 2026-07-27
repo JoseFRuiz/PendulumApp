@@ -16,27 +16,22 @@ class MotionDetector(
     companion object {
         const val DEFAULT_THRESHOLD = 2.0f
         private const val WARMUP_EVENTS = 10
-        private const val COOLDOWN_MS = 500L
+        private const val COOLDOWN_MS = 400L
     }
 
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
-    private val accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-
-    private var gravityX = 0f
-    private var gravityY = 0f
-    private var gravityZ = 0f
-    private val alpha = 0.8f
+    private val linearAccelSensor = sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
 
     private var warmupCount = 0
     private var lastTriggerTime = 0L
+    // True while the swing Y magnitude is above the threshold (approaching or at the extreme)
+    private var inExtreme = false
 
     fun startListening() {
         warmupCount = 0
         lastTriggerTime = 0L
-        gravityX = 0f
-        gravityY = 0f
-        gravityZ = 0f
-        accelerometer?.let {
+        inExtreme = false
+        linearAccelSensor?.let {
             sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
         }
     }
@@ -46,28 +41,29 @@ class MotionDetector(
     }
 
     override fun onSensorChanged(event: SensorEvent) {
-        if (event.sensor.type != Sensor.TYPE_ACCELEROMETER) return
-
-        val x = event.values[0]
-        val y = event.values[1]
-        val z = event.values[2]
-
-        gravityX = alpha * gravityX + (1 - alpha) * x
-        gravityY = alpha * gravityY + (1 - alpha) * y
-        gravityZ = alpha * gravityZ + (1 - alpha) * z
+        if (event.sensor.type != Sensor.TYPE_LINEAR_ACCELERATION) return
 
         warmupCount++
         if (warmupCount < WARMUP_EVENTS) return
 
-        val linearX = x - gravityX
-        val linearY = y - gravityY
-        val linearZ = z - gravityZ
+        val linearX = event.values[0]
+        val linearY = event.values[1]
+        val linearZ = event.values[2]
 
-        val isLeftToRight = linearX > threshold
-                && linearX > abs(linearY)
-                && linearX > abs(linearZ)
+        // Negative Y = top-to-bottom motion → detects one specific extreme of the pendulum.
+        // If the wrong extreme triggers, change -linearY to +linearY on the next line.
+        val swingY = -linearY
+        val isYDominant = swingY > abs(linearX) && swingY > abs(linearZ)
 
-        if (isLeftToRight) {
+        // Rising edge: entering the extreme zone
+        if (isYDominant && swingY > threshold) {
+            inExtreme = true
+        }
+
+        // Falling edge: the extreme has just been passed and the phone is returning to center.
+        // Fire here — once per extreme, at a consistent point in the arc.
+        if (inExtreme && swingY < threshold * 0.5f) {
+            inExtreme = false
             val now = System.currentTimeMillis()
             if (now - lastTriggerTime > COOLDOWN_MS) {
                 lastTriggerTime = now

@@ -12,3 +12,6 @@
 *.jks
 *.keystore
 local.properties
+
+# Video files
+*.mp4
