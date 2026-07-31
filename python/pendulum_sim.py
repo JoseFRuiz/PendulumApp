@@ -5,13 +5,13 @@ import numpy as np
 import os
 
 # Tune these constants to adjust the simulation layout
-AMPLITUDE_DEG = 30.0    # max swing angle from vertical, in degrees
-PERIOD_SEC    = 2.0     # full oscillation period in seconds
-SCREEN_SCALE  = 0.5     # scale factor applied to the video frame before compositing
+AMPLITUDE_DEG = 27.0    # max swing angle from vertical, in degrees
+PERIOD_SEC    = 1.87     # full oscillation period in seconds
+SCREEN_SCALE  = 0.35     # scale factor applied to the video frame before compositing
                         # (with CANVAS_W/H_MULT=2 this makes the canvas = original video resolution)
-CANVAS_W_MULT = 2       # canvas width  = scaled_frame_width  × this
-CANVAS_H_MULT = 2       # canvas height = scaled_frame_height × this
-ARM_RATIO     = 0.50    # arm length as a fraction of canvas height
+CANVAS_W_MULT = 3       # canvas width  = scaled_frame_width  × this
+CANVAS_H_MULT = 3       # canvas height = scaled_frame_height × this
+ARM_RATIO     = 1.0    # arm length as a fraction of canvas height
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -50,7 +50,7 @@ sh = int(vh * SCREEN_SCALE)   # screen height on canvas
 canvas_w = sw * CANVAS_W_MULT  # with SCREEN_SCALE=0.5 + MULT=2 → canvas = original video size
 canvas_h = sh * CANVAS_H_MULT
 pivot_x  = canvas_w // 2
-arm_len  = canvas_h * ARM_RATIO
+arm_len  = min(canvas_h * ARM_RATIO, canvas_h - sh / 2)  # keep screen bottom inside canvas
 
 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 out = cv2.VideoWriter(output_path, fourcc, fps, (canvas_w, canvas_h))
