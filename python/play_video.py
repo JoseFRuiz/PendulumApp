@@ -2,17 +2,21 @@ import argparse
 import cv2
 import os
 
-VIDEO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "baile_pendulo_modified_pendulum.mp4")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_VIDEO_FILE = "baile_pendulo_modified_pendulum.mp4"
 
-# VIDEO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pendulo.mp4")
-
-parser = argparse.ArgumentParser(description="Play baile_pendulo_colored.mp4 at variable speed.")
+parser = argparse.ArgumentParser(description="Play a video at variable speed.")
+parser.add_argument("video", nargs="?", default=DEFAULT_VIDEO_FILE,
+                    help=f"Video file to play (default: {DEFAULT_VIDEO_FILE}). "
+                         "A bare filename is resolved relative to this script's directory.")
 parser.add_argument("rate", nargs="?", type=float, default=1.0,
                     help="Playback speed rate (default 1.0; e.g. 0.9=slower, 1.1=faster)")
 parser.add_argument("--step", action="store_true",
                     help="Frame-by-frame mode: press any key to advance one step, Q to quit.")
 args = parser.parse_args()
 rate = max(0.01, args.rate)
+
+VIDEO_FILE = args.video if os.path.isabs(args.video) else os.path.join(SCRIPT_DIR, args.video)
 
 cap = cv2.VideoCapture(VIDEO_FILE)
 if not cap.isOpened():
