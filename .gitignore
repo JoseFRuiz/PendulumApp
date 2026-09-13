@@ -15,3 +15,7 @@ local.properties
 
 # Video files
 *.mp4
+
+# Python
+__pycache__/
+*.pyc

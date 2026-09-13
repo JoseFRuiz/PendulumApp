@@ -32,10 +32,26 @@ parser.add_argument("--period", type=float, default=PERIOD_SEC,
 parser.add_argument("--start", type=float, default=0.0,
                     help="Start offset in seconds. Positive: skip that many seconds from the video. "
                          "Negative: prepend that many seconds of fully white frames before the video.")
-parser.add_argument("--catchup-sec", type=float, default=0.6,
-                    help="Seconds to close a video/pendulum position error via proportional "
-                         "correction (default: 0.6). Smaller = snappier correction (risk of "
-                         "overshoot); larger = smoother but slower to lock in.")
+parser.add_argument("--kp", type=float, default=1 / 0.6,
+                    help="Proportional gain (1/sec): deg/sec of correction per degree of position "
+                         "error (default: 1.667, equivalent to the previous --catchup-sec 0.6). "
+                         "Higher = snappier correction (risk of overshoot); lower = smoother but "
+                         "slower to lock in.")
+parser.add_argument("--ki", type=float, default=0.0,
+                    help="Integral gain (1/sec^2): deg/sec of correction per (deg*sec) of "
+                         "accumulated error (default: 0.0, i.e. off). Trims persistent/systematic "
+                         "tracking bias (e.g. a slightly mismatched --period) that --kp alone "
+                         "settles for; too high risks slow oscillation.")
+parser.add_argument("--kd", type=float, default=0.0,
+                    help="Derivative gain, dimensionless: deg/sec of correction per (deg/sec) of "
+                         "how fast the error itself is changing (default: 0.0, i.e. off). Can "
+                         "reduce overshoot, but differentiates an already-noisy detected-angle "
+                         "signal, so it's noise-sensitive; --max-accel already limits overshoot "
+                         "at the actuator level.")
+parser.add_argument("--i-limit", type=float, default=15.0,
+                    help="Anti-windup clamp on the accumulated integral error, in deg*sec "
+                         "(default: 15.0). Also reset to zero whenever detection is unreliable "
+                         "(a gap, or nowhere detected at all).")
 parser.add_argument("--min-rate", type=float, default=0.25,
                     help="Minimum video playback speed multiplier (default: 0.25).")
 parser.add_argument("--max-rate", type=float, default=3.0,
@@ -52,7 +68,10 @@ start_sec     = args.start
 min_rate      = max(0.01, args.min_rate)  # must stay strictly positive: guarantees loop termination
 max_rate      = max(min_rate, args.max_rate)
 max_accel     = max(0.0, args.max_accel)
-catchup_sec   = max(0.01, args.catchup_sec)
+Kp            = args.kp
+Ki            = args.ki
+Kd            = args.kd
+i_limit       = abs(args.i_limit)
 MIN_SLOPE_DEG = 0.05  # local slope (deg/source-frame) below which we treat the signal as flat
 
 input_path        = os.path.join(SCRIPT_DIR, args.input_file)
@@ -123,11 +142,15 @@ floor_angle_history = []  # degrees or None, one entry per output frame
 # Online video-speed controller state: vpos is the virtual (fractional) source
 # frame position, monotonic non-decreasing so the video only ever plays forward
 # (never seeks backward); rate is the current playback speed multiplier. Each
-# video frame, vpos is nudged so that the real detected angle at that position
-# tracks the ideal pendulum's current angle (see the crossing-search below),
-# reusing play_video.py's two-frame blend window for smooth sub-frame playback.
-vpos = float(start_frame_idx)
-rate = 1.0
+# video frame, vpos is nudged (via a feedforward + PID correction on the local
+# position error, see below) so the real detected angle at that position tracks
+# the ideal pendulum's current angle, reusing play_video.py's two-frame blend
+# window for smooth sub-frame playback.
+vpos           = float(start_frame_idx)
+rate           = 1.0
+integral_error = 0.0   # deg*sec, accumulated for the I term; anti-windup below
+prev_error     = None  # deg, previous frame's error, for the D term
+tracking_errors = []   # deg, one entry per frame with a valid measurement (for the end-of-run summary)
 ret, frame_a = cap.read(); frame_a = frame_a if ret else None
 ret, frame_b = cap.read(); frame_b = frame_b if ret else None
 next_src_idx = start_frame_idx + 1
@@ -175,27 +198,41 @@ while True:
         # the video's real angle to be -theta, not +theta.
         #
         # The needed playback rate is computed directly from the real signal's
-        # local slope plus a proportional position-error correction (feedforward
-        # + P control), rather than searching forward for a future value match:
-        # a forward search fails whenever the real signal has already passed the
-        # target locally and won't recross it (same direction) until a full
-        # period later, which is common since the video's phase drifts relative
-        # to the ideal pendulum's.
+        # local slope plus a feedforward + PID position-error correction, rather
+        # than searching forward for a future value match: a forward search fails
+        # whenever the real signal has already passed the target locally and
+        # won't recross it (same direction) until a full period later, which is
+        # common since the video's phase drifts relative to the ideal pendulum's.
+        #
+        # target_deriv is feedforward (we know the ideal pendulum's motion
+        # exactly, so there's no need to wait for an I-term to "catch up" to it);
+        # Kp/Ki/Kd then correct for the position error between the real signal
+        # and the target, in the classic PID sense.
         target_deg   = -math.degrees(sim_theta)
         target_deriv = -amplitude_deg * (2 * math.pi / period) * math.cos(2 * math.pi * t / period)  # deg/sec
 
         i = int(vpos)
         if use_fallback or i + 1 >= len(angle_filled):
             desired_rate = 1.0
+            integral_error = 0.0  # no valid measurement: don't let the I-term wind up
+            prev_error = None
         else:
             frac        = vpos - i
             real_here   = angle_filled[i] + frac * (angle_filled[i + 1] - angle_filled[i])
             local_slope = angle_filled[i + 1] - angle_filled[i]  # degrees per source-frame
             if abs(local_slope) < MIN_SLOPE_DEG:
                 desired_rate = 1.0  # flat/gap region: no reliable local direction, just coast
+                integral_error = 0.0
+                prev_error = None
             else:
                 error = target_deg - real_here
-                desired_d_real_dt = target_deriv + error / catchup_sec  # deg/sec
+                tracking_errors.append(error)
+
+                integral_error = max(-i_limit, min(i_limit, integral_error + error / fps))
+                derror_dt = 0.0 if prev_error is None else (error - prev_error) * fps
+                prev_error = error
+
+                desired_d_real_dt = target_deriv + Kp * error + Ki * integral_error + Kd * derror_dt  # deg/sec
                 desired_rate = desired_d_real_dt / (local_slope * fps)
 
         rate += max(-max_accel, min(max_accel, desired_rate - rate))
@@ -293,4 +330,13 @@ while True:
 cap.release()
 out.release()
 out_clean.release()
+
+if tracking_errors:
+    errs = np.array(tracking_errors)
+    mean_err = float(np.mean(errs))
+    rms_err  = float(np.sqrt(np.mean(errs ** 2)))
+    print(f"\nTracking error over {len(errs)} valid frames: "
+          f"mean={mean_err:+.2f} deg, rms={rms_err:.2f} deg "
+          f"(Kp={Kp:.3f}, Ki={Ki:.3f}, Kd={Kd:.3f})")
+
 print(f"\nDone. Saved to:\n  {output_path}\n  {output_path_clean}")

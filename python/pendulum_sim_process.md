@@ -178,6 +178,69 @@ terms since they'll need real-world equivalents on the device:
 | Knob | What it controls |
 |---|---|
 | Amplitude / period | The idealized pendulum's swing size and rhythm — stands in for the real arm's physical amplitude/period once one exists. |
-| Catch-up time | How many seconds the system gives itself to close a gap between where the video is and where it needs to be. Shorter = snappier but prone to overshoot; longer = smoother but slower to lock in. |
+| Kp (proportional gain) | How hard the system corrects in proportion to the *current* gap between where the video is and where it needs to be. Higher = snappier but prone to overshoot; lower = smoother but slower to lock in. (This is the renamed, generalized form of what was originally called "catch-up time.") |
+| Ki (integral gain) | How hard the system corrects for a gap that has *persisted* over time, rather than just the instantaneous one. This is what trims out a small, systematic bias that Kp alone settles for and never fully closes — see §9. |
+| Kd (derivative gain) | How hard the system reacts to the gap *changing quickly*, as a second, independent brake on overshoot. Off by default — see §9 for why. |
 | Speed limits | The slowest and fastest the video is ever allowed to play, regardless of how large the gap is. |
 | Speed-change limit | How quickly the playback speed itself is allowed to ramp up or down, frame to frame — this is what keeps corrections invisible rather than jarring. |
+
+## 9. Addendum — reframing the steering as a PID controller
+
+After the process above was working, the natural next question was: is this
+steering logic actually a known, named thing? It turns out it already was — just
+not using the standard name for it. This section records that reframing and what
+was learned by testing it.
+
+**What it already was.** The correction described in §4 — "how far off are we, and
+how hard should we push back" — is precisely the *proportional* term of a classic
+PID (Proportional-Integral-Derivative) controller. What made it *more* than a bare
+proportional controller is that it's paired with **feedforward**: because the
+idealized pendulum's exact motion is known in advance (it's a formula, not a
+mystery), the system doesn't need to wait for accumulated error to nudge it toward
+the right general behavior — it's handed the right answer directly, and only has to
+correct the *remaining* gap. Feedforward plus a proportional term, it turns out, is
+usually a better fit than a plain PID for *tracking a known, moving target* — a bare
+PID is really built for holding a *fixed* setpoint steady against unknown
+disturbances.
+
+**What was missing: memory of a persistent gap.** A pure proportional term reacts
+only to the gap *right now* — it has no memory. If the video consistently runs a
+little behind (say, because the idealized pendulum's assumed rhythm doesn't quite
+match reality), a P-only correction will settle into tracking with a small,
+permanent lag rather than closing it, because as the lag shrinks, so does the very
+correction meant to close it. Adding an **integral term** — a running memory of the
+gap, accumulated over time — fixes exactly this: even a tiny, persistent lag
+eventually accumulates into a correction big enough to erase it.
+
+**Why this matters more once this moves to real hardware.** In the simulation, the
+"idealized pendulum" is a hand-picked formula (a chosen amplitude and period) doing
+its best to describe recorded footage of an actual human-swung pendulum — which
+was never going to be a perfect sine wave to begin with. Once this runs on the real
+installation, the exact same kind of gap reappears in a new form: whatever rhythm
+the phone's live sensor reports will never *exactly* match whatever assumptions the
+control loop makes about it. An integral term is precisely the piece designed to
+quietly absorb that kind of persistent, real-world mismatch — the simulation is a
+good place to have already found this out.
+
+**What testing found.** Deliberately mismatching the idealized pendulum's assumed
+period from the real recorded footage's actual rhythm — a stand-in for the drift
+that's guaranteed once a real, physical arm replaces the formula — the proportional
+term alone left a substantial residual tracking error. Adding a modest integral term
+cut that error by roughly two-thirds, with no other change. Turned up further, it
+started to overcorrect and hunt — the classic integral-gain trade-off — so there is
+a sensible middle setting, not "more is better." Interestingly, the same
+improvement showed up even *without* a deliberate mismatch: real, human-swung motion
+never perfectly matches an idealized sine wave in the first place, so the integral
+term earns its keep even in the best case, not only the deliberately mismatched one.
+
+A derivative term was also tried, on top of the tuned integral term. It helped only
+marginally, and mostly at small settings — consistent with the earlier prediction
+that it wasn't likely to be worth much here, since a slew-rate limit on the output
+already guards against the same kind of overshoot a derivative term targets, and a
+derivative term reacts to a signal that's already somewhat noisy (the detected floor
+angle), which is exactly the kind of signal a derivative term tends to amplify
+rather than smooth.
+
+**Net conclusion:** feedforward + proportional + a modest integral term is the
+combination worth carrying forward to the real installation; the derivative term is
+available (and configurable) but not carrying its weight so far.
