@@ -1,14 +1,22 @@
 # PendulumApp
 
-An Android app that plays a user-selected video whenever it detects a left-to-right swipe of the phone. Right-to-left, vertical, and other movements are ignored.
+An Android app for a physical art installation: a phone mounted on a real swinging
+pendulum plays a pre-recorded video, continuously speeding up and slowing down playback
+so the video's own recorded floor-tilt cancels the pendulum's live physical tilt — the
+recorded floor reads as level to a viewer despite the whole rig visibly swinging. See
+`python/pendulum_sim_process.md` for the full design story and `CLAUDE.md` for the
+architecture.
 
 ## Features
 
-- Detects left-to-right phone movement via accelerometer
-- Plays and restarts a video from the beginning on each detected swipe
+- Continuously tracks the phone's live tilt angle (gravity + gyroscope) and steers video
+  playback speed to compensate for it in real time — a feedforward + PID control loop
+- Plays a specific, pre-analyzed video bundled with the app (its recorded floor-tilt
+  timeline is exported once, offline, via `python/export_angle_track.py`)
 - Video loops continuously until paused or stopped
 - No internet connection or special permissions required
-- Pick any video from your phone's gallery
+- A debug-build-only video picker lets you preview an arbitrary video at fixed 1x speed
+  (no tracking, since it has no matching timeline) for visual smoke-testing
 
 ## Requirements
 
@@ -68,12 +76,14 @@ An Android app that plays a user-selected video whenever it detects a left-to-ri
 
 ## How to Use
 
-1. Tap **Select Video** and pick a video from your gallery
-2. Tap **Start** to begin motion detection
-3. Swipe the phone from **left to right** — the video plays from the beginning
-4. Swipe left-to-right again at any time to restart the video
-5. Tap **Pause** to temporarily stop detection; tap **Start** again to resume
-6. Tap **Stop** to fully stop detection and video playback
+1. Tap **Start** — the bundled video plays immediately and the app begins tracking the
+   phone's live tilt to steer playback speed
+2. Mount the phone on the pendulum arm and let it swing — the recorded floor should read
+   as level despite the physical swinging (see `python/pendulum_sim_process.md`)
+3. Tap **Pause** to temporarily stop tracking and playback; tap **Start** again to resume
+4. Tap **Stop** to fully stop and reset back to the beginning
+5. (Debug builds only) **Select Video** picks an arbitrary video to preview at a fixed
+   1x speed, with no pendulum tracking — for visual smoke-testing only
 
 ---
 
@@ -81,9 +91,21 @@ An Android app that plays a user-selected video whenever it detects a left-to-ri
 
 ```
 app/src/main/java/com/pendulumapp/
-├── MainActivity.kt       # UI, video picker, state machine
-├── MotionDetector.kt     # Accelerometer listener, directional swipe logic
-└── AppState.kt           # IDLE / DETECTING / PAUSED enum
+├── MainActivity.kt              # UI, playback, state machine, control-loop wiring
+├── PendulumTiltSensor.kt        # Live tilt angle + angular velocity (gravity + gyroscope)
+├── PendulumSpeedController.kt   # Feedforward + PID control loop -> playback speed
+├── AngleTimeline.kt             # Loads/interpolates a video's exported angle track
+├── PendulumTuning.kt            # Kp/Ki/Kd and other tunable constants
+└── AppState.kt                  # IDLE / DETECTING / PAUSED enum
+
+app/src/main/assets/
+├── dancer.mp4                   # The installation's video (source footage)
+└── dancer_angles.json           # Its recorded floor-tilt timeline, from export_angle_track.py
+
+python/
+├── pendulum_sim.py              # PC-side prototype/reference for the control law
+├── pendulum_sim_process.md      # Design write-up -- read this first
+└── export_angle_track.py        # Generates the JSON sidecar bundled above
 ```
 
 ## Build Commands

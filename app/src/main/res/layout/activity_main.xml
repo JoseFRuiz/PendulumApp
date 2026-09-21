@@ -29,24 +29,28 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
+    <!-- Live angle/rate/error readout, driven by PendulumSpeedController's onTick callback.
+         Gated behind BuildConfig.DEBUG in MainActivity -- see python/pendulum_sim_process.md
+         section 6: a controller that "looked plausible" from the video alone was once
+         silently disengaged, only caught by watching its internal numbers. This is the
+         Android equivalent of watching those numbers during bring-up. -->
     <TextView
-        android:id="@+id/motionIndicator"
+        android:id="@+id/debugReadout"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="@string/motion_detected"
-        android:textSize="22sp"
-        android:textStyle="bold"
+        android:layout_margin="8dp"
+        android:text=""
+        android:textSize="14sp"
+        android:fontFamily="monospace"
         android:textColor="#FFFFFF"
         android:background="#CC000000"
-        android:paddingStart="12dp"
-        android:paddingEnd="12dp"
-        android:paddingTop="6dp"
-        android:paddingBottom="6dp"
+        android:paddingStart="8dp"
+        android:paddingEnd="8dp"
+        android:paddingTop="4dp"
+        android:paddingBottom="4dp"
         android:visibility="invisible"
         app:layout_constraintTop_toTopOf="@id/videoView"
-        app:layout_constraintBottom_toBottomOf="@id/videoView"
-        app:layout_constraintStart_toStartOf="@id/videoView"
-        app:layout_constraintEnd_toEndOf="@id/videoView" />
+        app:layout_constraintStart_toStartOf="@id/videoView" />
 
     <Button
         android:id="@+id/btnSelectVideo"

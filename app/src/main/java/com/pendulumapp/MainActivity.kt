@@ -1,6 +1,7 @@
 package com.pendulumapp
 
 import android.content.Intent
+import android.content.res.AssetFileDescriptor
 import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.media.MediaPlayer
@@ -16,19 +17,42 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import com.pendulumapp.databinding.ActivityMainBinding
+import kotlin.math.abs
 import kotlin.math.min
 
 class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
 
+    companion object {
+        private const val BUNDLED_VIDEO_ASSET = "dancer.mp4"
+        private const val BUNDLED_ANGLES_ASSET = "dancer_angles.json"
+    }
+
     private lateinit var binding: ActivityMainBinding
-    private var motionDetector: MotionDetector? = null
     private var currentState = DetectionState.IDLE
-    private var videoUri: Uri? = null
+
+    // The installation always has a bundled, pre-analyzed video + angle track (see
+    // python/export_angle_track.py). The SAF picker below is a debug-only escape hatch for
+    // visually smoke-testing an arbitrary video; a dev-picked video has no matching angle
+    // track, so it plays at a fixed 1x with no pendulum tracking -- real closed-loop testing
+    // always uses the bundled asset. See python/pendulum_sim_process.md for why the video
+    // analysis itself stays offline/PC-side rather than running live on-device.
+    private var angleTimeline: AngleTimeline? = null
+    private var usingBundledVideo = true
+    private var devVideoUri: Uri? = null
+
     private var mediaPlayer: MediaPlayer? = null
     private var surface: Surface? = null
     private var isPlayerPrepared = false
+    // Start() may be pressed before prepareAsync() finishes; MediaPlayer.start() throws if
+    // called before prepared, so a pending start is deferred to onPreparedListener instead.
+    private var pendingAutoStart = false
+
+    private var tiltSensor: PendulumTiltSensor? = null
+    private var speedController: PendulumSpeedController? = null
+    private var lastAppliedRate = 1.0f
+
     private val handler = Handler(Looper.getMainLooper())
-    private var hideIndicatorRunnable: Runnable? = null
+    private var controlTickRunnable: Runnable? = null
 
     private val videoPickerLauncher = registerForActivityResult(
         ActivityResultContracts.OpenDocument()
@@ -38,8 +62,9 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
                 it,
                 Intent.FLAG_GRANT_READ_URI_PERMISSION
             )
-            videoUri = it
-            setupMediaPlayer(it)
+            devVideoUri = it
+            usingBundledVideo = false
+            setupMediaPlayerFromUri(it)
             Toast.makeText(this, R.string.video_selected, Toast.LENGTH_SHORT).show()
         }
     }
@@ -50,14 +75,25 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         binding.videoView.surfaceTextureListener = this
+        binding.btnSelectVideo.visibility = if (BuildConfig.DEBUG) View.VISIBLE else View.GONE
+        angleTimeline = loadBundledAngleTimeline()
         setupButtons()
         updateUI()
     }
 
+    private fun loadBundledAngleTimeline(): AngleTimeline? = try {
+        AngleTimeline.loadFromAsset(this, BUNDLED_ANGLES_ASSET)
+    } catch (e: Exception) {
+        null
+    }
+
     override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
         surface = Surface(st)
-        // If a player already exists but has no surface (picked video before surface was ready), attach it now
-        mediaPlayer?.setSurface(surface) ?: videoUri?.let { setupMediaPlayer(it) }
+        when {
+            mediaPlayer != null -> mediaPlayer?.setSurface(surface)
+            usingBundledVideo -> setupMediaPlayerFromAsset(BUNDLED_VIDEO_ASSET)
+            else -> devVideoUri?.let { setupMediaPlayerFromUri(it) }
+        }
     }
 
     override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
@@ -72,35 +108,55 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
         binding.btnSelectVideo.setOnClickListener {
             videoPickerLauncher.launch(arrayOf("video/*"))
         }
-        binding.btnStart.setOnClickListener {
-            if (videoUri == null) {
-                Toast.makeText(this, R.string.select_video_first, Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
-            }
-            startDetecting()
-        }
+        binding.btnStart.setOnClickListener { startDetecting() }
         binding.btnPause.setOnClickListener { pauseDetecting() }
         binding.btnStop.setOnClickListener { stopDetecting() }
     }
 
-    private fun setupMediaPlayer(uri: Uri) {
+    private fun onPlayerPrepared(mp: MediaPlayer) {
+        isPlayerPrepared = true
+        binding.videoView.post { applyVideoTransform(mp.videoWidth, mp.videoHeight) }
+        if (pendingAutoStart && currentState == DetectionState.DETECTING) {
+            pendingAutoStart = false
+            mp.start()
+        }
+    }
+
+    private fun setupMediaPlayerFromAsset(assetName: String) {
+        isPlayerPrepared = false
+        mediaPlayer?.release()
+        val afd: AssetFileDescriptor = assets.openFd(assetName)
+        mediaPlayer = MediaPlayer().apply {
+            setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
+            afd.close()
+            surface?.let { setSurface(it) }
+            setOnPreparedListener { mp -> onPlayerPrepared(mp) }
+            setOnCompletionListener { mp ->
+                speedController?.reset()
+                mp.seekTo(0)
+                mp.start()
+            }
+            setOnErrorListener { _, _, _ ->
+                setupMediaPlayerFromAsset(BUNDLED_VIDEO_ASSET)
+                true
+            }
+            prepareAsync()
+        }
+    }
+
+    private fun setupMediaPlayerFromUri(uri: Uri) {
         isPlayerPrepared = false
         mediaPlayer?.release()
         mediaPlayer = MediaPlayer().apply {
             setDataSource(this@MainActivity, uri)
             surface?.let { setSurface(it) }
-            setOnPreparedListener { mp ->
-                isPlayerPrepared = true
-                binding.videoView.post { applyVideoTransform(mp.videoWidth, mp.videoHeight) }
-            }
+            setOnPreparedListener { mp -> onPlayerPrepared(mp) }
             setOnCompletionListener { mp ->
-                // Drive looping manually — more reliable than isLooping across Android versions
                 mp.seekTo(0)
                 mp.start()
             }
             setOnErrorListener { _, _, _ ->
-                // On error, recreate the player so playback can resume
-                videoUri?.let { setupMediaPlayer(it) }
+                devVideoUri?.let { setupMediaPlayerFromUri(it) }
                 true
             }
             prepareAsync()
@@ -108,51 +164,125 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
     }
 
     private fun startDetecting() {
-        if (motionDetector == null) {
-            motionDetector = MotionDetector(this) {
-                runOnUiThread { onMotionDetected() }
-            }
+        if (mediaPlayer == null) {
+            Toast.makeText(this, R.string.select_video_first, Toast.LENGTH_SHORT).show()
+            return
         }
+
+        val fresh = currentState == DetectionState.IDLE
+        if (tiltSensor == null) tiltSensor = PendulumTiltSensor(this)
+
         currentState = DetectionState.DETECTING
         updateUI()
 
-        Handler(Looper.getMainLooper()).postDelayed({
-            if (currentState == DetectionState.DETECTING) {
-                motionDetector?.startListening()
+        if (fresh) {
+            lastAppliedRate = 1.0f
+            val timeline = angleTimeline
+            val sensor = tiltSensor!!
+            speedController = if (timeline != null) {
+                PendulumSpeedController(
+                    timeline = timeline,
+                    getLiveAngleDeg = { sensor.angleDeg },
+                    getLiveAngularVelocityDegPerSec = { sensor.angularVelocityDegPerSec },
+                    hasLiveAngle = { sensor.hasAngleReading },
+                    getVideoPositionMs = { mediaPlayer?.currentPosition ?: 0 },
+                    applySpeed = ::applySpeed,
+                    onTick = ::onControlTick
+                )
+            } else {
+                null
             }
-        }, 1000)
+            speedController?.reset()
+
+            if (timeline == null) {
+                binding.debugReadout.visibility = if (BuildConfig.DEBUG) View.VISIBLE else View.INVISIBLE
+                binding.debugReadout.text = getString(R.string.dev_video_no_tracking)
+            }
+
+            if (isPlayerPrepared) {
+                mediaPlayer?.seekTo(0)
+            }
+        }
+
+        if (isPlayerPrepared) {
+            mediaPlayer?.start()
+        } else {
+            pendingAutoStart = true
+        }
+
+        tiltSensor?.start()
+        if (angleTimeline != null) startControlLoop()
     }
 
     private fun pauseDetecting() {
-        motionDetector?.stopListening()
+        pendingAutoStart = false
+        stopControlLoop()
+        tiltSensor?.stop()
         mediaPlayer?.pause()
         currentState = DetectionState.PAUSED
         updateUI()
     }
 
     private fun stopDetecting() {
-        motionDetector?.stopListening()
-        motionDetector = null
+        pendingAutoStart = false
+        stopControlLoop()
+        tiltSensor?.stop()
+        tiltSensor = null
+        speedController = null
+        binding.debugReadout.visibility = View.INVISIBLE
+
         if (mediaPlayer?.isPlaying == true) mediaPlayer?.stop()
-        videoUri?.let { setupMediaPlayer(it) }
+        if (usingBundledVideo) {
+            setupMediaPlayerFromAsset(BUNDLED_VIDEO_ASSET)
+        } else {
+            devVideoUri?.let { setupMediaPlayerFromUri(it) }
+        }
+
         currentState = DetectionState.IDLE
         updateUI()
     }
 
-    private fun onMotionDetected() {
-        if (currentState == DetectionState.DETECTING && isPlayerPrepared) {
-            mediaPlayer?.let { if (!it.isPlaying) it.start() }
+    private fun startControlLoop() {
+        stopControlLoop()
+        val r = object : Runnable {
+            override fun run() {
+                speedController?.tick()
+                handler.postDelayed(this, PendulumTuning.TICK_INTERVAL_MS)
+            }
         }
-        showMotionIndicator()
+        controlTickRunnable = r
+        handler.post(r)
     }
 
-    private fun showMotionIndicator() {
-        binding.motionIndicator.visibility = View.VISIBLE
-        hideIndicatorRunnable?.let { handler.removeCallbacks(it) }
-        hideIndicatorRunnable = Runnable {
-            binding.motionIndicator.visibility = View.INVISIBLE
+    private fun stopControlLoop() {
+        controlTickRunnable?.let { handler.removeCallbacks(it) }
+        controlTickRunnable = null
+    }
+
+    /** [PendulumSpeedController]'s applySpeed callback -- pushes the controller's chosen
+     * playback rate to the real player, throttled so near-zero deltas don't cause audible
+     * AudioTrack reconfiguration glitches (the controller's internal rate still updates
+     * every tick regardless of whether this actually reaches the player). */
+    private fun applySpeed(rate: Float) {
+        val mp = mediaPlayer ?: return
+        if (!isPlayerPrepared) return
+        if (abs(rate - lastAppliedRate) < PendulumTuning.SPEED_APPLY_EPSILON) return
+        try {
+            mp.playbackParams = mp.playbackParams.setSpeed(rate).setPitch(1.0f)
+            lastAppliedRate = rate
+        } catch (e: IllegalStateException) {
+            // Player mid-release/re-prepare (e.g. error recovery) -- skip, next tick retries.
         }
-        handler.postDelayed(hideIndicatorRunnable!!, 400)
+    }
+
+    private fun onControlTick(info: PendulumSpeedController.TickInfo) {
+        if (!BuildConfig.DEBUG) return
+        binding.debugReadout.visibility = View.VISIBLE
+        val errText = info.error?.let { String.format("%+.1f", it) } ?: "--"
+        binding.debugReadout.text = String.format(
+            "angle: %+.1f°  rate: %.2fx  err: %s°",
+            info.liveAngleDeg, info.rate, errText
+        )
     }
 
     private fun applyVideoTransform(videoWidth: Int, videoHeight: Int) {
@@ -205,19 +335,26 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
 
     override fun onPause() {
         super.onPause()
-        if (currentState == DetectionState.DETECTING) motionDetector?.stopListening()
+        if (currentState == DetectionState.DETECTING) {
+            stopControlLoop()
+            tiltSensor?.stop()
+        }
     }
 
     override fun onResume() {
         super.onResume()
-        if (currentState == DetectionState.DETECTING) motionDetector?.startListening()
+        if (currentState == DetectionState.DETECTING) {
+            tiltSensor?.start()
+            if (angleTimeline != null) startControlLoop()
+        }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        hideIndicatorRunnable?.let { handler.removeCallbacks(it) }
-        motionDetector?.stopListening()
-        motionDetector = null
+        stopControlLoop()
+        tiltSensor?.stop()
+        tiltSensor = null
+        speedController = null
         mediaPlayer?.release()
         mediaPlayer = null
         surface?.release()

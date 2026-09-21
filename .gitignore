@@ -13,8 +13,9 @@
 *.keystore
 local.properties
 
-# Video files
+# Video files (generated previews/renders) -- but the bundled app asset is real content
 *.mp4
+!app/src/main/assets/*.mp4
 
 # Python
 __pycache__/
