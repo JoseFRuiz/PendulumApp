@@ -51,6 +51,13 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
     private var speedController: PendulumSpeedController? = null
     private var lastAppliedRate = 1.0f
 
+    // Debug-only CSV logger pairing sensor readings with the video's own recorded angle,
+    // for offline analysis when the compensation isn't tracking -- see PendulumDebugLogger's
+    // doc comment for the adb pull path. Never constructed in release builds.
+    private val debugLogger: PendulumDebugLogger? by lazy {
+        if (BuildConfig.DEBUG) PendulumDebugLogger(this) else null
+    }
+
     private val handler = Handler(Looper.getMainLooper())
     private var controlTickRunnable: Runnable? = null
 
@@ -193,6 +200,7 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
                 null
             }
             speedController?.reset()
+            if (timeline != null) debugLogger?.start()
 
             if (timeline == null) {
                 binding.debugReadout.visibility = if (BuildConfig.DEBUG) View.VISIBLE else View.INVISIBLE
@@ -277,6 +285,8 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
 
     private fun onControlTick(info: PendulumSpeedController.TickInfo) {
         if (!BuildConfig.DEBUG) return
+        debugLogger?.logTick(info)
+
         binding.debugReadout.visibility = View.VISIBLE
         val errText = info.error?.let { String.format("%+.1f", it) } ?: "--"
         binding.debugReadout.text = String.format(
@@ -298,10 +308,12 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
         val matrix = Matrix()
         // Undo MediaPlayer's stretch so the content represents the true video dimensions
         matrix.postScale(vw / tw, vh / th, cx, cy)
-        // Rotate 90° clockwise
-        matrix.postRotate(90f, cx, cy)
-        // Scale rotated content (now vh×vw) to fit within the view (tw×th), preserving aspect ratio
-        val scale = min(tw / vh, th / vw)
+        // Scale to fit within the view, preserving aspect ratio and native orientation --
+        // NO rotation. The bundled video's recorded floor edge must stay horizontal, as
+        // filmed (see python/pendulum_sim_process.md); the old 90° rotation here was left
+        // over from a prior version of this app that assumed a portrait-recorded picked
+        // video needing correction, which doesn't apply to this landscape source footage.
+        val scale = min(tw / vw, th / vh)
         matrix.postScale(scale, scale, cx, cy)
 
         binding.videoView.setTransform(matrix)

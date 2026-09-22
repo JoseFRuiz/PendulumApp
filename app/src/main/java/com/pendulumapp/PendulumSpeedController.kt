@@ -43,12 +43,20 @@ class PendulumSpeedController(
     private val minSlopeDegPerFrame: Double = PendulumTuning.MIN_SLOPE_DEG_PER_FRAME,
     private val tickIntervalMs: Long = PendulumTuning.TICK_INTERVAL_MS
 ) {
-    /** Snapshot of one tick's internals, for the optional debug readout. */
+    /** Snapshot of one tick's internals, for the optional debug readout/logger. `error`,
+     * `realHere` and `localSlopePerSec` are null exactly when the tick fell back to coasting
+     * (no live angle yet, or the video's local slope was too flat to steer by) -- that's
+     * itself useful to log, since "always coasting" with a null `error` is a different failure
+     * mode than "tracking, but with unexpectedly large `error`". */
     data class TickInfo(
         val liveAngleDeg: Float,
-        val rate: Float,
+        val liveAngularVelocityDegPerSec: Float,
+        val videoPosMs: Int,
+        val targetDeg: Double,
+        val realHere: Double?,
+        val localSlopePerSec: Double?,
         val error: Double?,
-        val realHere: Double?
+        val rate: Float
     )
 
     // Python's MAX_ACCEL/MIN_SLOPE_DEG are expressed per source-*frame*; re-derive them
@@ -89,11 +97,20 @@ class PendulumSpeedController(
             dt = tickIntervalMs / 1000.0
         }
 
+        val videoPosMs = getVideoPositionMs()
+        val liveAngle = getLiveAngleDeg().toDouble()
+        val liveAngularVelocity = getLiveAngularVelocityDegPerSec().toDouble()
+
+        // The arm's rotation is applied on top of whatever tilt is already baked into the
+        // video, so for the two to cancel (rather than double) the target is the OPPOSITE
+        // of the live pendulum angle -- see process doc section 6.
+        val targetDeg = -liveAngle
+        val targetDeriv = -liveAngularVelocity
+
+        val sample = if (hasLiveAngle()) timeline.lookup(videoPosMs) else null
+
         val desiredRate: Double
         var error: Double? = null
-        var realHere: Double? = null
-
-        val sample = if (hasLiveAngle()) timeline.lookup(getVideoPositionMs()) else null
 
         if (sample == null || abs(sample.localSlopePerSec) < minSlopeDegPerSec) {
             // No reliable local direction to steer by (flat/gap region, or no sensor
@@ -102,16 +119,6 @@ class PendulumSpeedController(
             prevError = null
             desiredRate = 1.0
         } else {
-            val liveAngle = getLiveAngleDeg().toDouble()
-            val liveAngularVelocity = getLiveAngularVelocityDegPerSec().toDouble()
-
-            // The arm's rotation is applied on top of whatever tilt is already baked into
-            // the video, so for the two to cancel (rather than double) the target is the
-            // OPPOSITE of the live pendulum angle -- see process doc section 6.
-            val targetDeg = -liveAngle
-            val targetDeriv = -liveAngularVelocity
-
-            realHere = sample.realHere
             val e = targetDeg - sample.realHere
             error = e
 
@@ -128,6 +135,17 @@ class PendulumSpeedController(
         rate = rate.coerceIn(minRate, maxRate)
 
         applySpeed(rate)
-        onTick?.invoke(TickInfo(getLiveAngleDeg(), rate, error, realHere))
+        onTick?.invoke(
+            TickInfo(
+                liveAngleDeg = liveAngle.toFloat(),
+                liveAngularVelocityDegPerSec = liveAngularVelocity.toFloat(),
+                videoPosMs = videoPosMs,
+                targetDeg = targetDeg,
+                realHere = sample?.realHere,
+                localSlopePerSec = sample?.localSlopePerSec,
+                error = error,
+                rate = rate
+            )
+        )
     }
 }

@@ -29,15 +29,17 @@ import kotlin.math.atan2
  *  - [axis] picks which device axis lies in the swing plane; this depends on how the phone
  *    is physically mounted on the arm and can only be determined by testing on the real
  *    hardware -- swing the phone by hand, log angleDeg, and confirm it changes sensibly.
- *  - The *sign* of angleDeg must match the JSON timeline's angleDeg convention so that
- *    `target = -angleDeg` in PendulumSpeedController actually cancels the video's recorded
- *    tilt rather than doubling it. This is the same class of bug documented in
- *    python/pendulum_sim_process.md section 6 (found once already, on the Python side) --
- *    verify sign before ever wiring this to playback speed, don't assume it.
+ *  - [invertSign] was confirmed needed on hardware: on-device testing found the raw sensor
+ *    sign made the video's rotation *double* the pendulum's live tilt instead of cancelling
+ *    it (target = -angleDeg in PendulumSpeedController was fighting the wrong direction) --
+ *    the exact class of bug python/pendulum_sim_process.md section 6 documents on the
+ *    Python side. If the physical mounting orientation changes, re-verify this by hand
+ *    (swing the phone, log angleDeg) rather than assuming the same sign still applies.
  */
 class PendulumTiltSensor(
     context: Context,
-    private val axis: Axis = Axis.Y
+    private val axis: Axis = Axis.Y,
+    private val invertSign: Boolean = true
 ) : SensorEventListener {
 
     enum class Axis { X, Y }
@@ -72,16 +74,18 @@ class PendulumTiltSensor(
     }
 
     override fun onSensorChanged(event: SensorEvent) {
+        val sign = if (invertSign) -1.0 else 1.0
         when (event.sensor.type) {
             Sensor.TYPE_GRAVITY -> {
                 val swingComponent = if (axis == Axis.Y) event.values[1] else event.values[0]
                 val downComponent = event.values[2]
-                angleDeg = Math.toDegrees(atan2(swingComponent.toDouble(), downComponent.toDouble())).toFloat()
+                val raw = Math.toDegrees(atan2(swingComponent.toDouble(), downComponent.toDouble()))
+                angleDeg = (sign * raw).toFloat()
                 hasAngleReading = true
             }
             Sensor.TYPE_GYROSCOPE -> {
                 val omegaRad = if (axis == Axis.Y) event.values[0] else event.values[1]
-                angularVelocityDegPerSec = Math.toDegrees(omegaRad.toDouble()).toFloat()
+                angularVelocityDegPerSec = (sign * Math.toDegrees(omegaRad.toDouble())).toFloat()
             }
         }
     }
