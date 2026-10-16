@@ -1,6 +1,9 @@
 """Shared floor-edge angle detection, used by floor_edge.py and pendulum_sim.py."""
 
 from collections import deque
+import json
+import os
+
 import cv2
 import numpy as np
 
@@ -29,6 +32,87 @@ MIN_CLUSTER_VOTES  = 2    # winning cluster needs at least this many supporting 
 MIN_TOTAL_SPAN_FRAC = 0.5 # all segments in the winning cluster combined must cover at least
                           # this fraction of frame width; floor fragments add up, body edges don't
 SMOOTH_WINDOW      = 7    # rolling-median window (smaller is OK with stricter admission gates)
+
+
+def line_angle_deg(x1, y1, x2, y2):
+    """Angle of the line from (x1,y1) to (x2,y2) in degrees, y-up convention (image
+    y grows downward), wrapped to (-90, 90]. The one angle formula used everywhere
+    a line's angle is needed, so detection and manual corrections agree."""
+    a = np.degrees(np.arctan2(-(y2 - y1), x2 - x1))
+    if a > 90:
+        a -= 180
+    elif a <= -90:
+        a += 180
+    return a
+
+
+def extend_line_to_width(point, direction, vw):
+    """Extend an infinite line (given a point and a direction vector) across the
+    full frame width, returning (0, y0, vw-1, y1) as ints. Returns None if
+    `direction` is (near-)vertical, since a floor edge is never near-vertical."""
+    x0, y0 = point
+    dx, dy = direction
+    if abs(dx) < 1e-6:
+        return None
+    slope = dy / dx
+    y_at = lambda x: y0 + (x - x0) * slope
+    return (0, int(round(y_at(0))), vw - 1, int(round(y_at(vw - 1))))
+
+
+def extend_two_points(x1, y1, x2, y2, vw):
+    """Extend the line through two given points across the full frame width."""
+    return extend_line_to_width((x1, y1), (x2 - x1, y2 - y1), vw)
+
+
+def fit_full_width_line(segments, vw):
+    """Fit one straight line through every endpoint of `segments` (a list of
+    (x1,y1,x2,y2) tuples) via total-least-squares (cv2.fitLine), extended across
+    the full frame width [0, vw-1]. Returns None if `segments` is empty or the fit
+    is degenerate (near-vertical -- shouldn't happen given MAX_FLOOR_ANGLE
+    filtering upstream, guarded defensively anyway).
+
+    This is what turns several disjoint Hough fragments of one continuous floor
+    edge into a single full-width line: fitting through all of them (rather than
+    just picking the single longest fragment) uses all the evidence and always
+    spans the whole frame, matching what the floor edge actually looks like.
+    """
+    if not segments:
+        return None
+    pts = np.array([[x1, y1] for x1, y1, x2, y2 in segments] +
+                    [[x2, y2] for x1, y1, x2, y2 in segments], dtype=np.float32)
+    vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+    return extend_line_to_width((x0, y0), (vx, vy), vw)
+
+
+def load_corrections(path):
+    """Load a {frame_index: (x1,y1,x2,y2)} manual-correction map saved by
+    edit_floor_edge.py. Returns an empty dict if the file doesn't exist."""
+    if not os.path.isfile(path):
+        return {}
+    with open(path) as f:
+        raw = json.load(f)
+    return {int(k): tuple(v) for k, v in raw.items()}
+
+
+def save_corrections(path, corrections):
+    """Save a {frame_index: (x1,y1,x2,y2)} manual-correction map as JSON."""
+    with open(path, "w") as f:
+        json.dump({str(k): list(v) for k, v in corrections.items()}, f)
+
+
+def apply_corrections(raw_angles, lines_raw, corrections):
+    """Overlay manual corrections onto detector output: for every frame index
+    present in `corrections`, replace that frame's angle (recomputed from the
+    corrected line, via line_angle_deg) and line. Returns new (raw_angles,
+    lines_raw) lists -- the inputs are not mutated.
+    """
+    raw_angles = list(raw_angles)
+    lines_raw  = list(lines_raw)
+    for idx, line in corrections.items():
+        if 0 <= idx < len(raw_angles):
+            raw_angles[idx] = line_angle_deg(*line)
+            lines_raw[idx]  = tuple(line)
+    return raw_angles, lines_raw
 
 
 class FloorEdgeDetector:
@@ -98,9 +182,7 @@ class FloorEdgeDetector:
             angle_buckets = {}
             for l in candidates:
                 lx1, ly1, lx2, ly2 = l[0]
-                a = np.degrees(np.arctan2(-(ly2 - ly1), lx2 - lx1))
-                if a > 90:     a -= 180
-                elif a <= -90: a += 180
+                a = line_angle_deg(lx1, ly1, lx2, ly2)
                 if abs(a) > MAX_FLOOR_ANGLE:
                     continue
                 b = round(a / ANGLE_BUCKET_DEG) * ANGLE_BUCKET_DEG
@@ -120,25 +202,26 @@ class FloorEdgeDetector:
 
                 best_bucket  = max(angle_buckets, key=_cluster_score)
                 bucket_lines = angle_buckets[best_bucket]
+                bucket_segments = [tuple(l[0]) for l in bucket_lines]
 
-                # Representative line = longest segment in the winning cluster
-                best = max(bucket_lines,
-                           key=lambda l: np.hypot(l[0][2] - l[0][0], l[0][3] - l[0][1]))[0]
-                x1, y1, x2, y2 = best
-                best_line = (x1, y1, x2, y2)
+                # Representative line: fit one straight line through every endpoint in
+                # the winning cluster and extend it across the full frame width, rather
+                # than just picking the single longest Hough fragment -- a continuous
+                # floor edge gets fragmented into several disjoint pieces, so the fit
+                # uses all the evidence and always spans the whole frame.
+                best_line = fit_full_width_line(bucket_segments, vw)
 
-                # Quality gates before updating the raw-angle history.
-                total_cluster_span = sum(
-                    np.hypot(l[0][2] - l[0][0], l[0][3] - l[0][1]) for l in bucket_lines)
-                span_ok    = np.hypot(x2 - x1, y2 - y1) / vw >= FLOOR_MIN_SPAN
+                # Quality gates before updating the raw-angle history -- based on the
+                # original (pre-fit) segment evidence, since best_line is now always
+                # full-width and a span check against it would be vacuously true.
+                longest_span = max(np.hypot(x2 - x1, y2 - y1) for x1, y1, x2, y2 in bucket_segments)
+                total_cluster_span = sum(np.hypot(x2 - x1, y2 - y1) for x1, y1, x2, y2 in bucket_segments)
+                span_ok    = longest_span / vw >= FLOOR_MIN_SPAN
                 votes_ok   = len(bucket_lines) >= MIN_CLUSTER_VOTES
                 cluster_ok = total_cluster_span >= vw * MIN_TOTAL_SPAN_FRAC
 
-                if span_ok and (votes_ok or cluster_ok):
-                    raw_angle = np.degrees(np.arctan2(-(y2 - y1), x2 - x1))
-                    if raw_angle > 90:     raw_angle -= 180
-                    elif raw_angle <= -90: raw_angle += 180
-                    self.raw_history.append(raw_angle)
+                if best_line is not None and span_ok and (votes_ok or cluster_ok):
+                    self.raw_history.append(line_angle_deg(*best_line))
 
         # Smoothed angle = median of recent valid detections (robust to ~50% bad frames)
         self.smoothed_angle = float(np.median(self.raw_history)) if self.raw_history else None

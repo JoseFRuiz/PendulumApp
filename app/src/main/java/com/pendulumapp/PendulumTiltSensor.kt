@@ -25,30 +25,49 @@ import kotlin.math.atan2
  * same noise-sensitivity problem python/pendulum_sim_process.md section 9 flags for a
  * differenced-signal derivative term).
  *
- * BRING-UP, NOT RESOLVABLE ON PAPER:
- *  - [axis] picks which device axis lies in the swing plane; this depends on how the phone
- *    is physically mounted on the arm and can only be determined by testing on the real
- *    hardware -- swing the phone by hand, log angleDeg, and confirm it changes sensibly.
- *  - [invertSign] was confirmed needed on hardware: on-device testing found the raw sensor
- *    sign made the video's rotation *double* the pendulum's live tilt instead of cancelling
- *    it (target = -angleDeg in PendulumSpeedController was fighting the wrong direction) --
- *    the exact class of bug python/pendulum_sim_process.md section 6 documents on the
- *    Python side. If the physical mounting orientation changes, re-verify this by hand
- *    (swing the phone, log angleDeg) rather than assuming the same sign still applies.
+ * AXIS CALIBRATION -- confirmed from an on-device log (see python/plot_debug_log.py's raw
+ * gravity-axis summary), not guessed:
+ *   gravityX: mean +9.38, spread 1.64  -> near +-9.8 at rest: this is the DOWN axis
+ *   gravityY: mean -0.14, spread 8.73  -> by far the largest swing: this is the SWING axis
+ *   gravityZ: mean -0.16, spread 0.54  -> flat/noise: irrelevant
+ * i.e. the phone is mounted with its screen roughly *vertical* (gravity sits on device X at
+ * rest), not flat as this class originally assumed (it shipped assuming device Z was "down",
+ * which matches a flat-on-a-table mounting, not an upright swinging one). [downAxisIndex]/
+ * [swingAxisIndex] encode that finding as data rather than an enum choice, and
+ * [rotationAxisIndex] is derived from them: the gyroscope component that measures rotation
+ * *about* the axis perpendicular to the down/swing plane is whichever of {0,1,2} isn't one of
+ * those two -- previously this read gyroX unconditionally, which was wrong for the same
+ * reason the down axis was wrong.
+ *
+ * [invertSign] RE-VERIFIED after the axis fix above, and flipped: changing which raw axis
+ * angleDeg is computed from (down axis Z -> X) changes the effective handedness of the
+ * measured angle, so the correct sign changed too, as expected. Confirmed from a real log
+ * (see python/plot_debug_log.py / the correlation check it's based on): with invertSign=true,
+ * target and realHere were WEAKLY ANTI-correlated (~-0.3) -- the controller was pushing the
+ * wrong direction on average, not just failing to converge. With invertSign=false, that
+ * relationship flips to weakly positive, the right sign (further tuning may still be needed
+ * for strength of tracking, but the *direction* is now correct). If the mounting changes
+ * again, re-check this the same way: pull a log, correlate `targetDeg` against `realHereDeg`
+ * -- it should come out positive, not negative. python/pendulum_sim_process.md section 6
+ * describes what "doubling instead of compensating" (i.e. the sign backwards) looks like.
  */
 class PendulumTiltSensor(
     context: Context,
-    private val axis: Axis = Axis.Y,
-    private val invertSign: Boolean = true
+    private val downAxisIndex: Int = 0,   // gravityX: confirmed "down" at rest, see class doc
+    private val swingAxisIndex: Int = 1,  // gravityY: confirmed swing axis, see class doc
+    private val invertSign: Boolean = false
 ) : SensorEventListener {
 
-    enum class Axis { X, Y }
+    // The remaining axis (0+1+2=3, so whichever index isn't downAxisIndex or swingAxisIndex)
+    // is the one the gyroscope should read: rotation about the axis perpendicular to the
+    // down/swing plane is exactly what changes the down/swing-plane angle over time.
+    private val rotationAxisIndex: Int = 3 - downAxisIndex - swingAxisIndex
 
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     private val gravitySensor = sensorManager.getDefaultSensor(Sensor.TYPE_GRAVITY)
     private val gyroSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
 
-    /** Live tilt angle from vertical, degrees. Sign convention: see class doc, bring-up. */
+    /** Live tilt angle from vertical, degrees. Sign convention: see class doc's AXIS CALIBRATION. */
     @Volatile
     var angleDeg: Float = 0f
         private set
@@ -62,6 +81,18 @@ class PendulumTiltSensor(
     @Volatile
     var hasAngleReading: Boolean = false
         private set
+
+    // Raw per-axis sensor values (device coordinates, m/s^2 and rad/s respectively),
+    // captured unconditionally regardless of downAxisIndex/swingAxisIndex/invertSign -- this
+    // is the actual data python/plot_debug_log.py's raw-gravity-axis summary was built from,
+    // and is what to re-check first if the mounting ever changes again. See PendulumDebugLogger,
+    // which logs these to the CSV.
+    @Volatile var gravityX: Float = 0f; private set
+    @Volatile var gravityY: Float = 0f; private set
+    @Volatile var gravityZ: Float = 0f; private set
+    @Volatile var gyroX: Float = 0f; private set
+    @Volatile var gyroY: Float = 0f; private set
+    @Volatile var gyroZ: Float = 0f; private set
 
     fun start() {
         gravitySensor?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
@@ -77,14 +108,22 @@ class PendulumTiltSensor(
         val sign = if (invertSign) -1.0 else 1.0
         when (event.sensor.type) {
             Sensor.TYPE_GRAVITY -> {
-                val swingComponent = if (axis == Axis.Y) event.values[1] else event.values[0]
-                val downComponent = event.values[2]
+                gravityX = event.values[0]
+                gravityY = event.values[1]
+                gravityZ = event.values[2]
+
+                val swingComponent = event.values[swingAxisIndex]
+                val downComponent = event.values[downAxisIndex]
                 val raw = Math.toDegrees(atan2(swingComponent.toDouble(), downComponent.toDouble()))
                 angleDeg = (sign * raw).toFloat()
                 hasAngleReading = true
             }
             Sensor.TYPE_GYROSCOPE -> {
-                val omegaRad = if (axis == Axis.Y) event.values[0] else event.values[1]
+                gyroX = event.values[0]
+                gyroY = event.values[1]
+                gyroZ = event.values[2]
+
+                val omegaRad = event.values[rotationAxisIndex]
                 angularVelocityDegPerSec = (sign * Math.toDegrees(omegaRad.toDouble())).toFloat()
             }
         }

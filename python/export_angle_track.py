@@ -27,7 +27,7 @@ import os
 
 import cv2
 
-from floor_detection import detect_sequence, fill_gaps
+from floor_detection import apply_corrections, detect_sequence, fill_gaps, load_corrections
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -39,11 +39,15 @@ parser.add_argument("input_file", nargs="?", default="baile_pendulo_modified.mp4
                          "Use the source footage, not a *_pendulum(.mp4|_clean.mp4) render.")
 parser.add_argument("--out", default=None,
                     help="Output JSON path (default: <stem>_angles.json next to the input file).")
+parser.add_argument("--corrections", default=None,
+                    help="Manual-correction sidecar from edit_floor_edge.py (default: "
+                         "<stem>_floor_edge_corrections.json next to the input file, if it exists).")
 args = parser.parse_args()
 
-input_path = os.path.join(SCRIPT_DIR, args.input_file)
-stem       = os.path.splitext(os.path.basename(args.input_file))[0]
-out_path   = args.out or os.path.join(SCRIPT_DIR, f"{stem}_angles.json")
+input_path  = os.path.join(SCRIPT_DIR, args.input_file)
+stem        = os.path.splitext(os.path.basename(args.input_file))[0]
+out_path    = args.out or os.path.join(SCRIPT_DIR, f"{stem}_angles.json")
+corr_path   = args.corrections or os.path.join(SCRIPT_DIR, f"{stem}_floor_edge_corrections.json")
 
 if "_pendulum" in stem:
     print(f"  Warning: '{args.input_file}' looks like a rendered pendulum-preview output, "
@@ -60,9 +64,19 @@ print(f"Analyzing floor edge angle in {args.input_file} ({total_frames} frames @
 detections = detect_sequence(cap, progress_label="detect")
 cap.release()
 
-raw_angles   = [a for a, _ in detections]
+raw_angles = [a for a, _ in detections]
+lines_raw  = [l for _, l in detections]
+detected   = [a is not None for a in raw_angles]  # before corrections: what the auto-detector found
+
+corrections = load_corrections(corr_path)
+if corrections:
+    print(f"  Applying {len(corrections)} manual correction(s) from {corr_path}")
+    raw_angles, lines_raw = apply_corrections(raw_angles, lines_raw, corrections)
+    for idx in corrections:
+        if 0 <= idx < len(detected):
+            detected[idx] = True  # a manual correction counts as ground truth too
+
 angle_filled = fill_gaps(raw_angles)
-detected     = [a is not None for a in raw_angles]
 
 n = len(angle_filled)
 coverage_pct = 100.0 * sum(detected) / n if n > 0 else 0.0

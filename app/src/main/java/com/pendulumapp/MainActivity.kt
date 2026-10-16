@@ -9,6 +9,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.view.Surface
 import android.view.TextureView
 import android.view.View
@@ -23,6 +24,7 @@ import kotlin.math.min
 class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
 
     companion object {
+        private const val TAG = "PendulumApp"
         private const val BUNDLED_VIDEO_ASSET = "dancer.mp4"
         private const val BUNDLED_ANGLES_ASSET = "dancer_angles.json"
     }
@@ -89,8 +91,11 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
     }
 
     private fun loadBundledAngleTimeline(): AngleTimeline? = try {
-        AngleTimeline.loadFromAsset(this, BUNDLED_ANGLES_ASSET)
+        AngleTimeline.loadFromAsset(this, BUNDLED_ANGLES_ASSET).also {
+            Log.i(TAG, "Loaded $BUNDLED_ANGLES_ASSET: fps=${it.fps} durationMs=${it.durationMs}")
+        }
     } catch (e: Exception) {
+        Log.e(TAG, "Failed to load $BUNDLED_ANGLES_ASSET -- tracking will be disabled", e)
         null
     }
 
@@ -185,6 +190,7 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
         if (fresh) {
             lastAppliedRate = 1.0f
             val timeline = angleTimeline
+            Log.i(TAG, "startDetecting: fresh start, timeline=${if (timeline != null) "loaded" else "NULL (no tracking/logging this run)"}, isPlayerPrepared=$isPlayerPrepared")
             val sensor = tiltSensor!!
             speedController = if (timeline != null) {
                 PendulumSpeedController(
@@ -285,7 +291,7 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
 
     private fun onControlTick(info: PendulumSpeedController.TickInfo) {
         if (!BuildConfig.DEBUG) return
-        debugLogger?.logTick(info)
+        tiltSensor?.let { debugLogger?.logTick(info, it) }
 
         binding.debugReadout.visibility = View.VISIBLE
         val errText = info.error?.let { String.format("%+.1f", it) } ?: "--"

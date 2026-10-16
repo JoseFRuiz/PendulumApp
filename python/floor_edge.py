@@ -3,7 +3,7 @@ import cv2
 import numpy as np
 import os
 
-from floor_detection import FloorEdgeDetector, render_curve_panel
+from floor_detection import FloorEdgeDetector, line_angle_deg, load_corrections, render_curve_panel
 
 try:
     import matplotlib.pyplot as plt
@@ -27,6 +27,12 @@ input_path  = os.path.join(SCRIPT_DIR, args.input_file)
 stem        = os.path.splitext(os.path.basename(args.input_file))[0]
 output_path = os.path.join(SCRIPT_DIR, f"{stem}_floor_edge.mp4")
 plot_path   = os.path.join(SCRIPT_DIR, f"{stem}_floor_edge_angle.png")
+corr_path   = os.path.join(SCRIPT_DIR, f"{stem}_floor_edge_corrections.json")
+
+corrections = load_corrections(corr_path)
+if corrections:
+    print(f"Applying {len(corrections)} manual correction(s) from {corr_path} "
+          "(shown in magenta -- see edit_floor_edge.py)")
 
 cap = cv2.VideoCapture(input_path)
 if not cap.isOpened():
@@ -52,6 +58,13 @@ while True:
         break
 
     smoothed_angle, best_line, lines = detector.process_frame(frame)
+
+    line_color = (0, 0, 255)  # red = auto-detected
+    if frame_number in corrections:
+        best_line = corrections[frame_number]
+        smoothed_angle = line_angle_deg(*best_line)
+        line_color = (255, 0, 255)  # magenta = manual correction
+
     angle_history.append(smoothed_angle)
 
     result = frame.copy()
@@ -64,7 +77,7 @@ while True:
 
     if best_line is not None:
         x1, y1, x2, y2 = best_line
-        cv2.line(result, (x1, y1), (x2, y2), (0, 0, 255), 3)
+        cv2.line(result, (x1, y1), (x2, y2), line_color, 3)
 
     if smoothed_angle is not None:
         label = f"{smoothed_angle:.1f} deg"

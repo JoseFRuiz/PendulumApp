@@ -4,7 +4,7 @@ import math
 import numpy as np
 import os
 
-from floor_detection import detect_sequence, fill_gaps, render_curve_panel
+from floor_detection import apply_corrections, detect_sequence, fill_gaps, load_corrections, render_curve_panel
 
 Y_PLOT_MIN = -60.0  # angle axis lower bound for the side curve panel (degrees)
 Y_PLOT_MAX =  60.0  # angle axis upper bound
@@ -78,6 +78,7 @@ input_path        = os.path.join(SCRIPT_DIR, args.input_file)
 stem              = os.path.splitext(os.path.basename(args.input_file))[0]
 output_path       = os.path.join(SCRIPT_DIR, f"{stem}_pendulum.mp4")
 output_path_clean = os.path.join(SCRIPT_DIR, f"{stem}_pendulum_clean.mp4")
+corr_path         = os.path.join(SCRIPT_DIR, f"{stem}_floor_edge_corrections.json")
 
 cap = cv2.VideoCapture(input_path)
 if not cap.isOpened():
@@ -92,9 +93,15 @@ total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 # itself) for every source frame, before any frame is composited onto the
 # swinging screen. ---
 print("Detecting floor edge angle (offline pass)...")
-detections   = detect_sequence(cap, progress_label="detect")
-raw_angles   = [a for a, _ in detections]
-lines_raw    = [l for _, l in detections]
+detections = detect_sequence(cap, progress_label="detect")
+raw_angles = [a for a, _ in detections]
+lines_raw  = [l for _, l in detections]
+
+corrections = load_corrections(corr_path)
+if corrections:
+    print(f"  Applying {len(corrections)} manual correction(s) from {corr_path}")
+    raw_angles, lines_raw = apply_corrections(raw_angles, lines_raw, corrections)
+
 angle_filled = fill_gaps(raw_angles)
 use_fallback = all(a is None for a in angle_filled)
 if use_fallback:

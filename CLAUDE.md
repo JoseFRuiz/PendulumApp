@@ -35,9 +35,12 @@ in `app/src/main/java/com/pendulumapp/`:
   swing-detector). Reads `TYPE_GRAVITY` (angle from vertical via one `atan2`, drift-free) and
   `TYPE_GYROSCOPE` (angular velocity directly, a cleaner feedforward source than differencing
   a noisy angle signal). Poll-based (`angleDeg`/`angularVelocityDegPerSec` fields), not
-  callback-based — the control loop's own timer decides when to read them. The `axis` param
-  and the sign of `angleDeg` both need on-hardware calibration (see the class doc comment) —
-  not resolvable on paper.
+  callback-based — the control loop's own timer decides when to read them. `downAxisIndex`/
+  `swingAxisIndex` (which raw gravity axis is "down" vs. the swing plane) are now calibrated
+  from an actual on-device log, not guessed — see the class doc comment for the numbers and
+  `PendulumDebugLogger`/`python/plot_debug_log.py` for how they were obtained. `invertSign`
+  still needs re-verification any time the mounting changes, since it's tuned against that
+  axis geometry.
 
 - **PendulumSpeedController.kt** — The ported feedforward + PID control law (see
   `python/pendulum_sim_process.md` sections 4/9): continuously computes a playback-speed
@@ -73,3 +76,14 @@ in `app/src/main/java/com/pendulumapp/`:
 `*_pendulum.mp4`/`*_pendulum_clean.mp4` render). To swap the installation's video, re-run that
 script against the new source footage and replace both files in `assets/` together — they must
 correspond to the same footage, or the control loop steers against the wrong timeline.
+
+The underlying Hough-transform detection (`floor_detection.py`'s `FloorEdgeDetector`) can pick
+the wrong line or miss the floor edge entirely on some frames — `python edit_floor_edge.py
+<video>.mp4` is an interactive frame-by-frame reviewer/editor for fixing those: it auto-jumps
+to frames flagged as suspect (no detection, or a sudden angle jump), lets you click-drag a
+replacement line (auto-extended across the full frame width, same as the detector's own output
+— see `floor_detection.fit_full_width_line`), and saves overrides to
+`<stem>_floor_edge_corrections.json`. `export_angle_track.py` and `floor_edge.py` both pick
+this file up automatically (via `floor_detection.load_corrections`/`apply_corrections`) if it
+exists next to the input video — re-run `export_angle_track.py` after editing corrections to
+refresh the bundled `dancer_angles.json`.
