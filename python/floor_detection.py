@@ -1,6 +1,7 @@
 """Shared floor-edge angle detection, used by floor_edge.py and pendulum_sim.py."""
 
 from collections import deque
+import hashlib
 import json
 import os
 
@@ -33,6 +34,20 @@ MIN_TOTAL_SPAN_FRAC = 0.5 # all segments in the winning cluster combined must co
                           # this fraction of frame width; floor fragments add up, body edges don't
 SMOOTH_WINDOW      = 7    # rolling-median window (smaller is OK with stricter admission gates)
 
+_DETECTION_PARAMS = (DILATE_KERNEL, CANNY_LOW, CANNY_HIGH, HOUGH_THRESHOLD, MIN_LINE_FRAC,
+                      MAX_LINE_GAP, PERSON_THRESH_MIN, PERSON_BRIGHT_THRESH, FLOOR_DARK_LOW,
+                      FLOOR_DARK_HIGH, FLOOR_Y_MIN, FLOOR_MIN_SPAN, MAX_FLOOR_ANGLE,
+                      ANGLE_BUCKET_DEG, MIN_CLUSTER_VOTES, MIN_TOTAL_SPAN_FRAC, SMOOTH_WINDOW)
+
+
+def _detection_params_fingerprint():
+    """A short hash of the tunable parameters above, so a cached detection pass
+    (load_detection_cache/save_detection_cache) can tell when this module's own
+    algorithm has changed underneath it -- just editing the constants above is
+    otherwise invisible to a cache keyed only on sourceVideo/frameCount -- and
+    fall back to a fresh pass instead of silently returning stale results."""
+    return hashlib.sha1(repr(_DETECTION_PARAMS).encode()).hexdigest()[:12]
+
 
 def line_angle_deg(x1, y1, x2, y2):
     """Angle of the line from (x1,y1) to (x2,y2) in degrees, y-up convention (image
@@ -62,6 +77,17 @@ def extend_line_to_width(point, direction, vw):
 def extend_two_points(x1, y1, x2, y2, vw):
     """Extend the line through two given points across the full frame width."""
     return extend_line_to_width((x1, y1), (x2 - x1, y2 - y1), vw)
+
+
+def line_from_angle(angle_deg, center_y, vw):
+    """Build a full-width line at `angle_deg` (line_angle_deg's convention) pivoting
+    about the fixed point (vw/2, center_y) -- the inverse of line_angle_deg, for
+    redrawing a polished angle track as a line that only rotates, never shifts
+    vertically. See polish_floor_edge.py's centerY, computed by averaging where
+    the raw detected lines cross the frame's horizontal center."""
+    theta = np.radians(angle_deg)
+    direction = (np.cos(theta), -np.sin(theta))
+    return extend_line_to_width((vw / 2.0, center_y), direction, vw)
 
 
 def fit_full_width_line(segments, vw):
@@ -98,6 +124,47 @@ def save_corrections(path, corrections):
     """Save a {frame_index: (x1,y1,x2,y2)} manual-correction map as JSON."""
     with open(path, "w") as f:
         json.dump({str(k): list(v) for k, v in corrections.items()}, f)
+
+
+def load_detection_cache(path, source_video, frame_count):
+    """Load a cached (raw_angles, lines_raw) detection pass saved by
+    save_detection_cache(), used to skip re-running detection on a video that's
+    already been analyzed. Returns None if the file doesn't exist, can't be read,
+    doesn't match `source_video`/`frame_count` (a stale cache from a different
+    video or a different cut of the same one must never be silently reused), or
+    was built under different detection parameters than are active now (see
+    _detection_params_fingerprint -- a tuning change in this module invalidates
+    old caches automatically, rather than relying on the caller to pass
+    --redetect)."""
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if data.get("sourceVideo") != source_video or data.get("frameCount") != frame_count:
+            return None
+        if data.get("paramsHash") != _detection_params_fingerprint():
+            return None
+        raw_angles = data["rawAngles"]
+        lines_raw  = [tuple(l) if l is not None else None for l in data["linesRaw"]]
+        return raw_angles, lines_raw
+    except Exception:
+        return None
+
+
+def save_detection_cache(path, source_video, frame_count, raw_angles, lines_raw):
+    """Save a (raw_angles, lines_raw) detection pass for load_detection_cache()."""
+    data = {
+        "sourceVideo": source_video,
+        "frameCount": frame_count,
+        "paramsHash": _detection_params_fingerprint(),
+        "rawAngles": raw_angles,
+        "linesRaw": [list(map(int, l)) if l is not None else None for l in lines_raw],
+    }
+    with open(path, "w") as f:
+        json.dump(data, f)
+
+
 
 
 def apply_corrections(raw_angles, lines_raw, corrections):
@@ -363,3 +430,81 @@ def fill_gaps(angles):
             break
 
     return filled
+
+
+def polish_sinusoidal(angles, fps, period_guess, window_periods=2.5,
+                       period_search_frac=0.08, period_search_steps=17,
+                       reject_sigma=2.5, robust_iters=2, trusted=None,
+                       trusted_weight=8.0):
+    """Smooth a per-frame angle track using the fact that a swinging pendulum's
+    angle can't jump around frame to frame -- it has to trace a smooth, roughly
+    periodic curve. For every frame, fits a sinusoid (amplitude/phase free, period
+    searched in a small window around `period_guess`) to a surrounding window of
+    `angles`, downweighting points that don't match it (robust reweighting, like a
+    mini RANSAC) before reading off that frame's polished value from the fit. This
+    is local, not one global sinusoid, so it still follows real amplitude/period
+    drift over a long clip -- see pendulum_sim.py's --period docs on why a single
+    fixed period doesn't hold up over a whole recording.
+
+    This both evens out ordinary per-frame detection jitter (even on frames that
+    were never flagged as wrong) and rides through brief stretches of bad detection
+    (occlusion, a wrong Hough line) as long as there's enough good data on either
+    side of them within the window to anchor the fit -- a cheap complement to, not
+    a replacement for, manually fixing frames via edit_floor_edge.py.
+
+    angles: a sequence of floats with no gaps (run fill_gaps first).
+    trusted: optional boolean array, same length as `angles`, marking frames whose
+    value is already known-good (e.g. a manual correction from edit_floor_edge.py).
+    Trusted points are weighted `trusted_weight` times as heavily in every window's
+    fit, and -- unlike ordinary points -- are never downweighted by the robust
+    outlier-rejection pass. The curve stays smooth and continuous, but bends toward
+    what's actually been verified by hand rather than treating it as just one more
+    (possibly noisy) sample to average over.
+    Returns a new numpy array, same length as `angles`.
+    """
+    values = np.asarray(angles, dtype=float)
+    n = len(values)
+    t = np.arange(n) / fps
+    trusted_mask = (np.zeros(n, dtype=bool) if trusted is None
+                     else np.asarray(trusted, dtype=bool))
+    half_win = max(4, int(round(window_periods * period_guess * fps / 2)))
+    periods = np.linspace(period_guess * (1 - period_search_frac),
+                           period_guess * (1 + period_search_frac),
+                           period_search_steps)
+
+    out = np.empty(n)
+    for i in range(n):
+        lo, hi = max(0, i - half_win), min(n, i + half_win + 1)
+        tw, yw, tr = t[lo:hi], values[lo:hi], trusted_mask[lo:hi]
+        base_w = np.where(tr, trusted_weight, 1.0)
+
+        best = None
+        for period in periods:
+            omega = 2 * np.pi / period
+            basis = np.column_stack([np.sin(omega * tw), np.cos(omega * tw), np.ones(len(tw))])
+            sw = np.sqrt(base_w)
+            beta, *_ = np.linalg.lstsq(basis * sw[:, None], yw * sw, rcond=None)
+            resid = yw - basis @ beta
+            sse = float(np.sum((resid * sw) ** 2))
+            if best is None or sse < best[0]:
+                best = (sse, omega, basis, beta, resid)
+        _, omega, basis, beta, resid = best
+
+        # Robust reweighting: refit excluding points far from the current fit
+        # (median-absolute-deviation threshold), so a few bad frames in the window
+        # don't drag the local fit toward them -- except trusted points, which are
+        # kept (at their full weight) regardless of residual.
+        for _ in range(robust_iters):
+            mad = np.median(np.abs(resid - np.median(resid))) * 1.4826 + 1e-6
+            keep = (np.abs(resid) < reject_sigma * mad) | tr
+            if keep.sum() < 4:
+                break
+            w = np.where(keep, base_w, 0.0)
+            sw = np.sqrt(w)
+            beta, *_ = np.linalg.lstsq(basis * sw[:, None], yw * sw, rcond=None)
+            resid = yw - basis @ beta
+
+        a, b, c = beta
+        out[i] = a * np.sin(omega * t[i]) + b * np.cos(omega * t[i]) + c
+
+    return out

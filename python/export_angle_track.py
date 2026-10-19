@@ -2,9 +2,10 @@
 for bundling into the Android app alongside the same video (see
 pendulum_sim_process.md and the app-port plan for how this is consumed).
 
-Reuses floor_detection.detect_sequence/fill_gaps unchanged -- this script does not
-reimplement detection, it only reshapes the same offline-analysis output pendulum_sim.py
-already relies on into a small, app-friendly JSON file.
+Never runs detection itself -- that's floor_edge.py's job (and edit_floor_edge.py/
+polish_floor_edge.py's, to build the --reference file this script requires). It only
+reshapes that already-detected/corrected/polished track into a small, app-friendly
+JSON file.
 
 IMPORTANT -- run this against the *source* footage (e.g. baile_pendulo_modified.mp4),
 never against a *_pendulum.mp4 / *_pendulum_clean.mp4 output. Those are the PC-side
@@ -27,7 +28,7 @@ import os
 
 import cv2
 
-from floor_detection import apply_corrections, detect_sequence, fill_gaps, load_corrections
+from floor_detection import apply_corrections, load_corrections
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -39,15 +40,18 @@ parser.add_argument("input_file", nargs="?", default="baile_pendulo_modified.mp4
                          "Use the source footage, not a *_pendulum(.mp4|_clean.mp4) render.")
 parser.add_argument("--out", default=None,
                     help="Output JSON path (default: <stem>_angles.json next to the input file).")
-parser.add_argument("--corrections", default=None,
-                    help="Manual-correction sidecar from edit_floor_edge.py (default: "
-                         "<stem>_floor_edge_corrections.json next to the input file, if it exists).")
+parser.add_argument("--reference", required=True,
+                    help="REQUIRED. This corrections-shaped JSON ({frame_index: [x1,y1,x2,y2]}, one "
+                         "entry per frame -- e.g. <stem>_floor_edge_polished.json from "
+                         "polish_floor_edge.py, or a hand-edited copy of it, see edit_floor_edge.py "
+                         "--corrections) is exported. This script never runs its own detection -- "
+                         "that's floor_edge.py's job (and edit_floor_edge.py/polish_floor_edge.py's, "
+                         "to build the file you point this at).")
 args = parser.parse_args()
 
 input_path  = os.path.join(SCRIPT_DIR, args.input_file)
 stem        = os.path.splitext(os.path.basename(args.input_file))[0]
 out_path    = args.out or os.path.join(SCRIPT_DIR, f"{stem}_angles.json")
-corr_path   = args.corrections or os.path.join(SCRIPT_DIR, f"{stem}_floor_edge_corrections.json")
 
 if "_pendulum" in stem:
     print(f"  Warning: '{args.input_file}' looks like a rendered pendulum-preview output, "
@@ -57,36 +61,20 @@ cap = cv2.VideoCapture(input_path)
 if not cap.isOpened():
     raise FileNotFoundError(f"Could not open: {input_path}")
 
-fps          = cap.get(cv2.CAP_PROP_FPS) or 30
-total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-print(f"Analyzing floor edge angle in {args.input_file} ({total_frames} frames @ {fps:.2f} fps)...")
-detections = detect_sequence(cap, progress_label="detect")
+fps = cap.get(cv2.CAP_PROP_FPS) or 30
 cap.release()
 
-raw_angles = [a for a, _ in detections]
-lines_raw  = [l for _, l in detections]
-detected   = [a is not None for a in raw_angles]  # before corrections: what the auto-detector found
-
-corrections = load_corrections(corr_path)
-if corrections:
-    print(f"  Applying {len(corrections)} manual correction(s) from {corr_path}")
-    raw_angles, lines_raw = apply_corrections(raw_angles, lines_raw, corrections)
-    for idx in corrections:
-        if 0 <= idx < len(detected):
-            detected[idx] = True  # a manual correction counts as ground truth too
-
-angle_filled = fill_gaps(raw_angles)
-
-n = len(angle_filled)
-coverage_pct = 100.0 * sum(detected) / n if n > 0 else 0.0
-print(f"  {sum(detected)}/{n} frames detected directly ({coverage_pct:.1f}%); "
-      f"the rest filled by carrying the nearest valid detection forward/backward.")
-
-use_fallback = all(a is None for a in raw_angles)
-if use_fallback:
-    print("  Warning: no floor edge detected anywhere in this video; the exported "
-          "angleDeg values are meaningless (all held at 0). Do not bundle this timeline.")
+reference_path = os.path.join(SCRIPT_DIR, args.reference)
+reference = load_corrections(reference_path)
+if not reference:
+    raise SystemExit(f"--reference {args.reference} not found or empty: {reference_path}")
+n = len(reference)
+print(f"--reference given: {reference_path} ({n} entries)")
+# apply_corrections, reused: a reference file is shaped exactly like a
+# corrections file (one line per frame -- see polish_floor_edge.py), so the
+# same function that overlays manual corrections fills in both arrays here.
+angle_filled, _lines_raw = apply_corrections([None] * n, [None] * n, reference)
+detected = [True] * n  # every frame in a reference file counts as ground truth
 
 t_ms = [round(i * 1000 / fps) for i in range(n)]
 angle_deg = [round(float(a), 3) if a is not None else 0.0 for a in angle_filled]

@@ -4,14 +4,20 @@ import math
 import numpy as np
 import os
 
-from floor_detection import apply_corrections, detect_sequence, fill_gaps, load_corrections, render_curve_panel
+from floor_detection import apply_corrections, load_corrections, render_curve_panel
 
 Y_PLOT_MIN = -60.0  # angle axis lower bound for the side curve panel (degrees)
 Y_PLOT_MAX =  60.0  # angle axis upper bound
 
-# Tune these constants to adjust the simulation layout
+# Tune these constants to adjust the simulation layout. Defaults below are measured
+# from baile_pendulo_modified.mp4's own recorded floor-edge signal (via floor_edge.py's
+# printed "Signal: period ~ ... max ~ ... min ~ ..." estimate) rather than guessed --
+# re-measure and update these if the default input video ever changes, since a
+# mismatched amplitude/period is the dominant source of tracking error (see the
+# --ki docs below: it does NOT compensate for this, only for a persistent bias once
+# amplitude/period are already well-matched).
 AMPLITUDE_DEG = 27.0    # max swing angle from vertical, in degrees
-PERIOD_SEC    = 1.87     # full oscillation period in seconds
+PERIOD_SEC    = 1.89     # full oscillation period in seconds
 SCREEN_SCALE  = 0.35     # scale factor applied to the video frame before compositing
                         # (with CANVAS_W/H_MULT=2 this makes the canvas = original video resolution)
 CANVAS_W_MULT = 3       # canvas width  = scaled_frame_width  × this
@@ -57,8 +63,21 @@ parser.add_argument("--min-rate", type=float, default=0.25,
 parser.add_argument("--max-rate", type=float, default=3.0,
                     help="Maximum video playback speed multiplier (default: 3.0).")
 parser.add_argument("--max-accel", type=float, default=0.04,
-                    help="Maximum change in playback speed per output frame (default: 0.04); "
-                         "bounds how fast the video can speed up or slow down.")
+                    help="Maximum DECREASE in playback speed per output frame (default: 0.04); "
+                         "bounds how fast the video can slow down.")
+parser.add_argument("--max-accel-up", type=float, default=0.08,
+                    help="Maximum INCREASE in playback speed per output frame (default: 0.08, "
+                         "twice --max-accel). Kept separate and faster than --max-accel so that "
+                         "once the controller has had to slow way down to resync (e.g. --min-rate), "
+                         "it recovers back toward normal speed quickly rather than crawling back up "
+                         "at the same cautious rate it slowed down with.")
+parser.add_argument("--reference", required=True,
+                    help="REQUIRED. This corrections-shaped JSON ({frame_index: [x1,y1,x2,y2]}, one "
+                         "entry per frame -- e.g. <stem>_floor_edge_polished.json from "
+                         "polish_floor_edge.py, or a hand-edited copy of it, see edit_floor_edge.py "
+                         "--corrections) is the control reference. This script never runs its own "
+                         "detection -- that's floor_edge.py's job (and edit_floor_edge.py/"
+                         "polish_floor_edge.py's, to build the file you point this at).")
 args = parser.parse_args()
 
 amplitude_rad = math.radians(args.amplitude)
@@ -68,6 +87,7 @@ start_sec     = args.start
 min_rate      = max(0.01, args.min_rate)  # must stay strictly positive: guarantees loop termination
 max_rate      = max(min_rate, args.max_rate)
 max_accel     = max(0.0, args.max_accel)
+max_accel_up  = max(0.0, args.max_accel_up)
 Kp            = args.kp
 Ki            = args.ki
 Kd            = args.kd
@@ -78,8 +98,6 @@ input_path        = os.path.join(SCRIPT_DIR, args.input_file)
 stem              = os.path.splitext(os.path.basename(args.input_file))[0]
 output_path       = os.path.join(SCRIPT_DIR, f"{stem}_pendulum.mp4")
 output_path_clean = os.path.join(SCRIPT_DIR, f"{stem}_pendulum_clean.mp4")
-corr_path         = os.path.join(SCRIPT_DIR, f"{stem}_floor_edge_corrections.json")
-
 cap = cv2.VideoCapture(input_path)
 if not cap.isOpened():
     raise FileNotFoundError(f"Could not open: {input_path}")
@@ -89,20 +107,17 @@ vw           = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 vh           = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-# --- Offline pass: detect the real floor-edge swing angle (and the edge line
-# itself) for every source frame, before any frame is composited onto the
-# swinging screen. ---
-print("Detecting floor edge angle (offline pass)...")
-detections = detect_sequence(cap, progress_label="detect")
-raw_angles = [a for a, _ in detections]
-lines_raw  = [l for _, l in detections]
+reference_path = os.path.join(SCRIPT_DIR, args.reference)
+reference = load_corrections(reference_path)
+if not reference:
+    raise SystemExit(f"--reference {args.reference} not found or empty: {reference_path}")
+print(f"--reference given: {reference_path} ({len(reference)} entries)")
+# apply_corrections, reused: a reference file is shaped exactly like a
+# corrections file (one line per frame -- see polish_floor_edge.py), so the
+# same function that overlays manual corrections fills in both arrays here.
+angle_filled, lines_raw = apply_corrections([None] * len(reference), [None] * len(reference),
+                                             reference)
 
-corrections = load_corrections(corr_path)
-if corrections:
-    print(f"  Applying {len(corrections)} manual correction(s) from {corr_path}")
-    raw_angles, lines_raw = apply_corrections(raw_angles, lines_raw, corrections)
-
-angle_filled = fill_gaps(raw_angles)
 use_fallback = all(a is None for a in angle_filled)
 if use_fallback:
     print("  No floor edge detected anywhere in the video; the video-speed "
@@ -242,7 +257,7 @@ while True:
                 desired_d_real_dt = target_deriv + Kp * error + Ki * integral_error + Kd * derror_dt  # deg/sec
                 desired_rate = desired_d_real_dt / (local_slope * fps)
 
-        rate += max(-max_accel, min(max_accel, desired_rate - rate))
+        rate += max(-max_accel, min(max_accel_up, desired_rate - rate))
         rate  = max(min_rate, min(max_rate, rate))
         vpos  = max(start_frame_idx, min(total_frames - 1, vpos + rate))
 
@@ -280,7 +295,7 @@ while True:
         # Negated to match sign convention with sim_angle_history: the arm compensates
         # the floor's tilt (target_deg above is -theta), so plotting -real_angle here
         # lets the two curves visually overlap when the controller is tracking well.
-        real_angle = raw_angles[idx] if idx < len(raw_angles) else None
+        real_angle = angle_filled[idx] if idx < len(angle_filled) else None
         floor_angle_history.append(-real_angle if real_angle is not None else None)
 
     theta = sim_theta  # the arm always follows the ideal pendulum, never the real detection
@@ -328,8 +343,20 @@ while True:
     frame_number += 1
 
     if frame_number % int(fps) == 0:
-        pct = 100 * frame_number // output_total_frames if output_total_frames > 0 else 0
-        print(f"  {frame_number}/{output_total_frames} frames  ({pct}%)")
+        # Percentage reflects the actual stopping condition (progress through the
+        # source video, vpos vs total_frames) rather than output_total_frames -- that's
+        # only an estimate for sizing the curve panel's x-axis, assuming the average
+        # playback rate is ~1x. If the controller runs persistently below 1x (e.g.
+        # pinned near --min-rate), rendering needs *more* output frames than the
+        # source video has, the estimate keeps growing to match, and a frame-count-based
+        # percentage would stay stuck at 100% long before the video is actually done.
+        if frame_number < n_white:
+            pct = 100 * frame_number // n_white if n_white > 0 else 100
+        else:
+            pct = 100 * int(vpos - start_frame_idx) // max(1, total_frames - 1 - start_frame_idx)
+        pct = min(100, max(0, pct))
+        print(f"  frame {frame_number} written, {pct}% through the source video "
+              f"(rate={rate:.2f}x)")
 
     if frame_number >= n_white and vpos >= total_frames - 1:
         break  # the last frame of the source video has now been rendered once

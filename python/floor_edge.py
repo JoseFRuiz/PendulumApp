@@ -3,7 +3,8 @@ import cv2
 import numpy as np
 import os
 
-from floor_detection import FloorEdgeDetector, line_angle_deg, load_corrections, render_curve_panel
+from floor_detection import (FloorEdgeDetector, apply_corrections, line_angle_deg, load_corrections,
+                              render_curve_panel)
 
 try:
     import matplotlib.pyplot as plt
@@ -21,6 +22,13 @@ parser = argparse.ArgumentParser(
 )
 parser.add_argument("input_file", nargs="?", default="baile_pendulo.mp4",
                     help="Input video filename in the same folder (default: baile_pendulo.mp4)")
+parser.add_argument("--reference", default=None,
+                    help="Use this corrections-shaped JSON ({frame_index: [x1,y1,x2,y2]}, one entry "
+                         "per frame -- e.g. <stem>_floor_edge_polished.json from polish_floor_edge.py, "
+                         "or a hand-edited copy of it, see edit_floor_edge.py --corrections) as the "
+                         "video's line/curve/angle-label instead of the raw detection/corrections -- "
+                         "not a comparison, a full swap. Requires a second pass over the video since "
+                         "the curve panel grows the reference curve frame by frame.")
 args = parser.parse_args()
 
 input_path  = os.path.join(SCRIPT_DIR, args.input_file)
@@ -28,11 +36,6 @@ stem        = os.path.splitext(os.path.basename(args.input_file))[0]
 output_path = os.path.join(SCRIPT_DIR, f"{stem}_floor_edge.mp4")
 plot_path   = os.path.join(SCRIPT_DIR, f"{stem}_floor_edge_angle.png")
 corr_path   = os.path.join(SCRIPT_DIR, f"{stem}_floor_edge_corrections.json")
-
-corrections = load_corrections(corr_path)
-if corrections:
-    print(f"Applying {len(corrections)} manual correction(s) from {corr_path} "
-          "(shown in magenta -- see edit_floor_edge.py)")
 
 cap = cv2.VideoCapture(input_path)
 if not cap.isOpened():
@@ -43,41 +46,90 @@ vw           = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 vh           = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-# Output video is twice as wide: left = edge detection, right = angle-vs-time curve
+LINE_COLOR            = (0, 0, 255)    # red -- raw detection/corrections
+REFERENCE_LINE_COLOR  = (60, 170, 0)   # green -- a --reference track
+
+if args.reference:
+    # A reference file already has one line per frame -- running detection just
+    # to immediately throw its result away would be pure waste, so it's skipped
+    # entirely rather than run and then overridden.
+    reference_path = os.path.join(SCRIPT_DIR, args.reference)
+    reference = load_corrections(reference_path)
+    if not reference:
+        raise SystemExit(f"--reference {args.reference} not found or empty: {reference_path}")
+    n = len(reference)
+    print(f"--reference given: {reference_path} ({n} entries) -- skipping raw detection entirely")
+    # apply_corrections, reused: a reference file is shaped exactly like a
+    # corrections file (one line per frame -- see polish_floor_edge.py), so the
+    # same function that overlays manual corrections fills in both arrays here.
+    angle_history, line_history = apply_corrections([None] * n, [None] * n, reference)
+    total_frames  = n
+    draw_color    = REFERENCE_LINE_COLOR
+    series_color  = REFERENCE_LINE_COLOR
+    series_label  = "reference"
+    cap.release()
+else:
+    corrections = load_corrections(corr_path)
+    if corrections:
+        print(f"Applying {len(corrections)} manual correction(s) from {corr_path} "
+              "(see edit_floor_edge.py)")
+    else:
+        print(f"No manual corrections found at {corr_path}")
+    print("No --reference given: running raw detection")
+
+    # --- Pass 1: detect, applying corrections, and remember enough per frame
+    # (line, angle) to redraw it in pass 2 without re-running detection. ---
+    detector      = FloorEdgeDetector(vw, vh)
+    angle_history = []   # smoothed angle (float) or None, one entry per frame
+    line_history  = []   # best_line (post-correction), one entry per frame
+    frame_number  = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        smoothed_angle, best_line, _lines = detector.process_frame(frame)
+
+        if frame_number in corrections:
+            best_line = corrections[frame_number]
+            smoothed_angle = line_angle_deg(*best_line)
+
+        angle_history.append(smoothed_angle)
+        line_history.append(best_line)
+        frame_number += 1
+
+        if frame_number % int(fps) == 0:
+            pct = 100 * frame_number // total_frames if total_frames > 0 else 0
+            print(f"  [detect] {frame_number}/{total_frames} frames  ({pct}%)")
+
+    cap.release()
+    draw_color   = LINE_COLOR
+    series_color = (30, 120, 220)
+    series_label = "floor edge angle"
+
+# --- Pass 2: redraw each frame with its (already-known) line/angle -- from
+# detection+corrections, or loaded whole from --reference -- and write the
+# output video. ---
 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 out = cv2.VideoWriter(output_path, fourcc, fps, (vw * 2, vh))
+cap2 = cv2.VideoCapture(input_path)
 
-
-detector      = FloorEdgeDetector(vw, vh)
-angle_history = []   # smoothed angle (float) or None, one entry per output frame
-frame_number  = 0
-
-while True:
-    ret, frame = cap.read()
+frame_number = 0
+while frame_number < len(angle_history):
+    ret, frame = cap2.read()
     if not ret:
+        print(f"  Warning: video ran out at frame {frame_number}, {len(angle_history)} expected "
+              f"from {'the --reference file' if args.reference else 'detection'}.")
         break
 
-    smoothed_angle, best_line, lines = detector.process_frame(frame)
-
-    line_color = (0, 0, 255)  # red = auto-detected
-    if frame_number in corrections:
-        best_line = corrections[frame_number]
-        smoothed_angle = line_angle_deg(*best_line)
-        line_color = (255, 0, 255)  # magenta = manual correction
-
-    angle_history.append(smoothed_angle)
-
     result = frame.copy()
+    smoothed_angle = angle_history[frame_number]
+    draw_line      = line_history[frame_number]
 
-    if lines is not None:
-        # Draw all Hough candidates in dim blue
-        for seg in lines:
-            sx1, sy1, sx2, sy2 = seg[0]
-            cv2.line(result, (sx1, sy1), (sx2, sy2), (180, 80, 0), 1)
-
-    if best_line is not None:
-        x1, y1, x2, y2 = best_line
-        cv2.line(result, (x1, y1), (x2, y2), line_color, 3)
+    if draw_line is not None:
+        x1, y1, x2, y2 = draw_line
+        cv2.line(result, (x1, y1), (x2, y2), draw_color, 3)
 
     if smoothed_angle is not None:
         label = f"{smoothed_angle:.1f} deg"
@@ -85,18 +137,19 @@ while True:
         cv2.putText(result, label, (10, 40), font, scale, (0, 0, 0), thick + 3, cv2.LINE_AA)
         cv2.putText(result, label, (10, 40), font, scale, (255, 255, 255), thick, cv2.LINE_AA)
 
-    curve_panel = render_curve_panel(
-        [{"history": angle_history, "color": (30, 120, 220), "label": "floor edge angle"}],
-        fps, total_frames, vw, vh, y_min=Y_PLOT_MIN, y_max=Y_PLOT_MAX)
+    series = [{"history": angle_history[:frame_number + 1], "color": series_color,
+               "label": series_label}]
+    curve_panel = render_curve_panel(series, fps, total_frames, vw, vh,
+                                      y_min=Y_PLOT_MIN, y_max=Y_PLOT_MAX)
     combined    = np.concatenate([result, curve_panel], axis=1)
     out.write(combined)
     frame_number += 1
 
     if frame_number % int(fps) == 0:
         pct = 100 * frame_number // total_frames if total_frames > 0 else 0
-        print(f"  {frame_number}/{total_frames} frames  ({pct}%)")
+        print(f"  [render] {frame_number}/{total_frames} frames  ({pct}%)")
 
-cap.release()
+cap2.release()
 out.release()
 
 # Build time / angle arrays
@@ -148,7 +201,8 @@ if _HAVE_MPL:
         title += "   |   " + "   ".join(parts)
 
     fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(times, angles, color="#1e78d4", linewidth=1.2, label="angle")
+    plot_color = "#3fa34d" if args.reference else "#1e78d4"
+    ax.plot(times, angles, color=plot_color, linewidth=1.4, label=series_label)
     ax.axhline(0, color="gray", linewidth=0.8, linestyle="--")
     if est_max is not None:
         ax.axhline(est_max, color="#d94f4f", linewidth=0.9, linestyle="--",
@@ -160,8 +214,7 @@ if _HAVE_MPL:
     ax.set_ylabel("Angle (degrees)")
     ax.set_title(title)
     ax.grid(True, alpha=0.3)
-    if est_max is not None or est_min is not None:
-        ax.legend(loc="lower right", fontsize=9)
+    ax.legend(loc="lower right", fontsize=9)
     fig.tight_layout()
     fig.savefig(plot_path, dpi=150)
     plt.close(fig)

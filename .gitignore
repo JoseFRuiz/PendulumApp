@@ -20,3 +20,8 @@ local.properties
 # Python
 __pycache__/
 *.pyc
+
+# Floor-edge detection cache -- pure speed optimization for edit_floor_edge.py/
+# polish_floor_edge.py, regenerable at any time from the source video; not meant
+# to be shared or diffed.
+python/*_floor_edge_detection_cache.json

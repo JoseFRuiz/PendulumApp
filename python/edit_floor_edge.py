@@ -7,21 +7,29 @@ gets it wrong -- picks the wrong line, or finds no line at all.
 Usage:
   python edit_floor_edge.py baile_pendulo.mp4
 
-  Afterwards, run whichever of these you actually need against the same video --
-  all three automatically pick up the saved corrections (see "Corrections" below),
-  there's no flag to pass:
-    python floor_edge.py baile_pendulo.mp4          # regenerate the preview video +
-                                                      # angle plot, to visually confirm
-                                                      # the corrections look right
-                                                      # (corrected frames draw magenta,
-                                                      # not red)
-    python pendulum_sim.py baile_pendulo.mp4         # regenerate the PC-side
-                                                      # installation-effect preview
-    python export_angle_track.py <source_video>.mp4  # regenerate the JSON actually
-                                                      # bundled into the Android app --
-                                                      # this is the one that matters for
+  Afterwards, to visually confirm the corrections look right (corrections are
+  picked up automatically here, no flag needed -- floor_edge.py is the one script
+  that's still allowed to run its own detection, as a standalone preview/debug tool):
+    python floor_edge.py baile_pendulo.mp4
+
+  Then build the smoothed, fixed-pivot reference track -- manually corrected frames
+  are passed through as trusted anchors, so the fit is pulled toward them instead of
+  risking smoothing them away:
+    python polish_floor_edge.py baile_pendulo.mp4    # writes <stem>_floor_edge_polished.json
+
+  pendulum_sim.py and export_angle_track.py never run detection themselves -- they
+  require --reference pointing at that file (or a hand-edited copy of it):
+    python pendulum_sim.py baile_pendulo.mp4 --reference baile_pendulo_floor_edge_polished.json
+    python export_angle_track.py <source_video>.mp4 --reference <...>_floor_edge_polished.json
+                                                      # the export is the one that matters for
                                                       # the real installation; see
                                                       # CLAUDE.md's "Bundled video asset"
+
+  If the polished track still has a frame or two worth fixing by hand, edit it
+  directly (see --corrections below) and re-polish from the edited result instead of
+  starting over -- this re-smooths around your edits rather than discarding them:
+    python edit_floor_edge.py baile_pendulo.mp4 --corrections baile_pendulo_floor_edge_polished.json
+    python polish_floor_edge.py baile_pendulo.mp4 --reference baile_pendulo_floor_edge_polished.json
 
 Controls:
   Right / D       next frame
@@ -34,18 +42,34 @@ Controls:
   Q / Esc         save and quit
 
 Corrections are saved to <stem>_floor_edge_corrections.json next to the input video, and
-automatically picked up by floor_edge.py, pendulum_sim.py, and export_angle_track.py the
-next time they run against the same video (see floor_detection.load_corrections/apply_corrections).
+automatically picked up by floor_edge.py (its one standalone-detection consumer) and by
+polish_floor_edge.py (which folds them in as trusted anchors) the next time they run
+against the same video (see floor_detection.load_corrections/apply_corrections).
+pendulum_sim.py and export_angle_track.py don't read this file directly -- they only ever
+take a full --reference track (e.g. the one polish_floor_edge.py builds from it).
+
+Pass --corrections to edit a different corrections-shaped file instead of the usual
+one -- e.g. to hand-tweak the polished track from polish_floor_edge.py:
+  python edit_floor_edge.py baile_pendulo.mp4 --corrections baile_pendulo_floor_edge_polished.json
+polish_floor_edge.py fills in every frame (not just outlier ones), but none of them were
+hand-drawn, so loading its output this way shows every frame as "auto (reference)"
+(green), not MANUAL -- only frames you actually drag a new line onto in this session
+flip to MANUAL (magenta). N/P still jumps by raw-detection quality, so you can find the
+frames most worth double-checking. The edited file then works with any script's
+--reference, same as always.
 
 Detection itself can be slow for long videos, so results are cached to
-<stem>_floor_edge_detection_cache.json after the first run and reused on subsequent runs.
-Pass --redetect to force a fresh detection pass (needed after any change to
-floor_detection.py's detection algorithm, since a stale cache would silently keep using the
-old results).
+<stem>_floor_edge_detection_cache.json after the first run and reused on subsequent runs --
+this script always prints whether it's using that cache or re-detecting, with the path, so
+it's never ambiguous which one produced what you're looking at. The cache is keyed on the
+source video, its frame count, AND a fingerprint of floor_detection.py's tunable detection
+parameters (_detection_params_fingerprint), so a tuning change there invalidates old caches
+on its own -- you don't need to remember to pass --redetect for that. --redetect remains
+available as a manual override (e.g. to force a fresh pass after editing an unrelated part
+of the detector, or just to be sure).
 """
 
 import argparse
-import json
 import os
 
 import cv2
@@ -53,7 +77,7 @@ import numpy as np
 
 from floor_detection import (
     FloorEdgeDetector, extend_two_points, line_angle_deg,
-    load_corrections, save_corrections,
+    load_corrections, load_detection_cache, save_corrections, save_detection_cache,
 )
 
 OUTLIER_JUMP_DEG = 8.0  # a raw-angle jump bigger than this from the previous valid
@@ -67,12 +91,17 @@ parser.add_argument("input_file", nargs="?", default="baile_pendulo.mp4",
                     help="Input video filename in the same folder (default: baile_pendulo.mp4)")
 parser.add_argument("--redetect", action="store_true",
                     help="Force a fresh detection pass instead of using a cached one.")
+parser.add_argument("--corrections", default=None,
+                    help="Edit this corrections-shaped JSON instead of the usual "
+                         "<stem>_floor_edge_corrections.json -- e.g. point it at "
+                         "<stem>_floor_edge_polished.json to hand-tweak the polished track.")
 args = parser.parse_args()
 
 input_path        = os.path.join(SCRIPT_DIR, args.input_file)
 stem              = os.path.splitext(os.path.basename(args.input_file))[0]
 cache_path        = os.path.join(SCRIPT_DIR, f"{stem}_floor_edge_detection_cache.json")
-corrections_path  = os.path.join(SCRIPT_DIR, f"{stem}_floor_edge_corrections.json")
+corrections_path  = (os.path.join(SCRIPT_DIR, args.corrections) if args.corrections
+                      else os.path.join(SCRIPT_DIR, f"{stem}_floor_edge_corrections.json"))
 
 cap = cv2.VideoCapture(input_path)
 if not cap.isOpened():
@@ -103,48 +132,33 @@ def run_detection():
     return raw_angles, lines_raw
 
 
-def load_cache():
-    if args.redetect or not os.path.isfile(cache_path):
-        return None
-    try:
-        with open(cache_path) as f:
-            data = json.load(f)
-        if data.get("sourceVideo") != args.input_file or data.get("frameCount") != total_frames:
-            return None
-        raw_angles = data["rawAngles"]
-        lines_raw  = [tuple(l) if l is not None else None for l in data["linesRaw"]]
-        return raw_angles, lines_raw
-    except Exception:
-        return None
-
-
-def save_cache(raw_angles, lines_raw):
-    data = {
-        "sourceVideo": args.input_file,
-        "frameCount": total_frames,
-        "rawAngles": raw_angles,
-        "linesRaw": [list(map(int, l)) if l is not None else None for l in lines_raw],
-    }
-    with open(cache_path, "w") as f:
-        json.dump(data, f)
-
-
-cached = load_cache()
+cached = None if args.redetect else load_detection_cache(cache_path, args.input_file, total_frames)
 if cached is not None:
     raw_angles, lines_raw = cached
     print(f"Using cached detection from {cache_path} ({len(raw_angles)} frames).")
     print("  Pass --redetect to force a fresh pass (needed after detection-algorithm changes).")
 else:
     raw_angles, lines_raw = run_detection()
-    save_cache(raw_angles, lines_raw)
+    save_detection_cache(cache_path, args.input_file, total_frames, raw_angles, lines_raw)
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
 n = len(raw_angles)
 corrections = load_corrections(corrections_path)
+# Loading the default <stem>_floor_edge_corrections.json: every entry genuinely IS
+# a manual correction, possibly from a past session, so it's shown as MANUAL right
+# away. Loading some other file via --corrections (e.g. polish_floor_edge.py's
+# output, where every frame already has a line but none of them were hand-drawn):
+# entries start out shown as auto, and only flip to MANUAL for frames actually
+# touched (dragged) in *this* session -- touched tracks exactly that.
+editing_reference = args.corrections is not None
+touched = set()
 if corrections:
-    print(f"Loaded {len(corrections)} existing manual correction(s) from {corrections_path}")
+    print(f"Loaded {len(corrections)} existing correction(s) from {corrections_path}")
+    if editing_reference:
+        print("  (loaded from a --corrections override, not the default file -- shown as "
+              "auto until you actually edit a frame)")
 else:
-    print("No existing manual corrections.")
+    print("No existing corrections.")
 
 
 def is_flagged(i):
@@ -203,6 +217,7 @@ def on_mouse(event, x, y, flags, userdata):
             line = extend_two_points(x1, y1, x2, y2, vw)
             if line is not None:
                 corrections[state["idx"]] = line
+                touched.add(state["idx"])
 
 
 cv2.setMouseCallback(WINDOW, on_mouse)
@@ -212,8 +227,10 @@ def render():
     i = state["idx"]
     img = get_frame(i).copy()
 
-    if i in corrections:
+    if i in corrections and (not editing_reference or i in touched):
         line, color, status = corrections[i], (255, 0, 255), "MANUAL"
+    elif i in corrections:
+        line, color, status = corrections[i], (0, 200, 0), "auto (reference)"
     elif lines_raw[i] is not None:
         if raw_angles[i] is not None:
             line, color, status = lines_raw[i], (0, 200, 0), "auto (trusted)"
@@ -266,6 +283,7 @@ while True:
         print(f"Saved {len(corrections)} correction(s) to {corrections_path}")
     elif key in (ord('r'), ord('R')):
         corrections.pop(state["idx"], None)
+        touched.discard(state["idx"])
     elif key in (ord('d'), ord('D'), 2555904, 65363):  # right arrow (Win / Linux+macOS)
         state["idx"] = min(n - 1, state["idx"] + 1)
     elif key in (ord('a'), ord('A'), 2424832, 65361):  # left arrow (Win / Linux+macOS)

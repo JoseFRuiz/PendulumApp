@@ -70,20 +70,32 @@ in `app/src/main/java/com/pendulumapp/`:
 
 ## Bundled video asset
 
-`app/src/main/assets/dancer.mp4` + `dancer_angles.json` are the installation's actual content
-— generated offline via `python export_angle_track.py <source_video>.mp4` (see
-`python/export_angle_track.py`'s docstring; it must run against source footage, never a
-`*_pendulum.mp4`/`*_pendulum_clean.mp4` render). To swap the installation's video, re-run that
-script against the new source footage and replace both files in `assets/` together — they must
-correspond to the same footage, or the control loop steers against the wrong timeline.
+`app/src/main/assets/dancer.mp4` + `dancer_angles.json` are the installation's actual content.
+Producing `dancer_angles.json` is a pipeline of four scripts, each reusing the previous one's
+output (see `python/edit_floor_edge.py`'s docstring for the authoritative step-by-step):
 
-The underlying Hough-transform detection (`floor_detection.py`'s `FloorEdgeDetector`) can pick
-the wrong line or miss the floor edge entirely on some frames — `python edit_floor_edge.py
-<video>.mp4` is an interactive frame-by-frame reviewer/editor for fixing those: it auto-jumps
-to frames flagged as suspect (no detection, or a sudden angle jump), lets you click-drag a
-replacement line (auto-extended across the full frame width, same as the detector's own output
-— see `floor_detection.fit_full_width_line`), and saves overrides to
-`<stem>_floor_edge_corrections.json`. `export_angle_track.py` and `floor_edge.py` both pick
-this file up automatically (via `floor_detection.load_corrections`/`apply_corrections`) if it
-exists next to the input video — re-run `export_angle_track.py` after editing corrections to
-refresh the bundled `dancer_angles.json`.
+1. `python floor_edge.py <source_video>.mp4` — runs the Hough-transform detection
+   (`floor_detection.py`'s `FloorEdgeDetector`) and renders a preview video + angle plot. It's
+   the one script still allowed to run detection standalone (no `--reference` needed); useful to
+   eyeball whether the auto-detection is any good before touching anything else.
+2. `python edit_floor_edge.py <source_video>.mp4` — interactive frame-by-frame reviewer/editor
+   for frames the detector got wrong (wrong line, or none at all): auto-jumps to frames flagged
+   as suspect (no detection, or a sudden angle jump), lets you click-drag a replacement line
+   (auto-extended across the full frame width, same as the detector's own output — see
+   `floor_detection.fit_full_width_line`), and saves overrides to
+   `<stem>_floor_edge_corrections.json`.
+3. `python polish_floor_edge.py <source_video>.mp4` — smooths the detected+corrected track into
+   a locally-sinusoidal, fixed-pivot reference (manually corrected frames are passed through as
+   trusted anchors, so the fit bends toward them rather than averaging them away) and writes
+   `<stem>_floor_edge_polished.json`, in the same `{frame_index: [x1,y1,x2,y2]}` shape as the
+   corrections file (loadable the same way, and itself re-editable via `edit_floor_edge.py
+   <video>.mp4 --corrections <stem>_floor_edge_polished.json`).
+4. `python export_angle_track.py <source_video>.mp4 --reference <stem>_floor_edge_polished.json`
+   — the one that actually matters for the installation; see `python/export_angle_track.py`'s
+   docstring. Must run against source footage, never a `*_pendulum.mp4`/`*_pendulum_clean.mp4`
+   render. `--reference` is required — this script (like `pendulum_sim.py`) never runs detection
+   itself, only `floor_edge.py`/`edit_floor_edge.py`/`polish_floor_edge.py` do.
+
+To swap the installation's video, redo this whole pipeline against the new source footage and
+replace both files in `assets/` together — they must correspond to the same footage, or the
+control loop steers against the wrong timeline.
