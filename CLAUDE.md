@@ -36,11 +36,14 @@ in `app/src/main/java/com/pendulumapp/`:
   `TYPE_GYROSCOPE` (angular velocity directly, a cleaner feedforward source than differencing
   a noisy angle signal). Poll-based (`angleDeg`/`angularVelocityDegPerSec` fields), not
   callback-based — the control loop's own timer decides when to read them. `downAxisIndex`/
-  `swingAxisIndex` (which raw gravity axis is "down" vs. the swing plane) are now calibrated
+  `swingAxisIndex` (which raw gravity axis is "down" vs. the swing plane) and `downAxisSign`
+  (whether that down axis reads positive or negative at rest — a mounting rotated ~180° about
+  the swing axis flips this without changing which axis or `invertSign`) are all calibrated
   from an actual on-device log, not guessed — see the class doc comment for the numbers and
-  `PendulumDebugLogger`/`python/plot_debug_log.py` for how they were obtained. `invertSign`
-  still needs re-verification any time the mounting changes, since it's tuned against that
-  axis geometry.
+  `PendulumDebugLogger`/`python/plot_debug_log.py` for how they were obtained. All three
+  (`downAxisIndex`/`swingAxisIndex`, `downAxisSign`, and `invertSign`) need independent
+  re-verification any time the mounting changes, since each is tuned against that specific
+  axis geometry and a change in one doesn't imply a change in the others.
 
 - **PendulumSpeedController.kt** — The ported feedforward + PID control law (see
   `python/pendulum_sim_process.md` sections 4/9): continuously computes a playback-speed

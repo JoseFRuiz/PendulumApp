@@ -127,6 +127,7 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
 
     private fun onPlayerPrepared(mp: MediaPlayer) {
         isPlayerPrepared = true
+        Log.i(TAG, "MediaPlayer prepared: ${mp.videoWidth}x${mp.videoHeight}, durationMs=${mp.duration}")
         binding.videoView.post { applyVideoTransform(mp.videoWidth, mp.videoHeight) }
         if (pendingAutoStart && currentState == DetectionState.DETECTING) {
             pendingAutoStart = false
@@ -138,6 +139,7 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
         isPlayerPrepared = false
         mediaPlayer?.release()
         val afd: AssetFileDescriptor = assets.openFd(assetName)
+        Log.i(TAG, "Opened asset '$assetName': length=${afd.length} startOffset=${afd.startOffset}")
         mediaPlayer = MediaPlayer().apply {
             setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
             afd.close()
@@ -148,8 +150,15 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
                 mp.seekTo(0)
                 mp.start()
             }
-            setOnErrorListener { _, _, _ ->
-                setupMediaPlayerFromAsset(BUNDLED_VIDEO_ASSET)
+            setOnErrorListener { _, what, extra ->
+                // MediaPlayer's own error callback -- previously silently retried forever
+                // with no trace in Logcat, which is indistinguishable from "video just
+                // never renders" at the UI level. Log the actual what/extra codes (see
+                // https://developer.android.com/reference/android/media/MediaPlayer.OnErrorListener
+                // for what they mean) and don't retry the same asset -- if it's broken,
+                // retrying it produces the same error again, just silently.
+                Log.e(TAG, "MediaPlayer error loading asset '$assetName': what=$what extra=$extra")
+                isPlayerPrepared = false
                 true
             }
             prepareAsync()

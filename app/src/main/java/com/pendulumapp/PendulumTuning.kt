@@ -20,11 +20,19 @@ object PendulumTuning {
 
     /**
      * Integral gain, 1/sec^2: deg/sec of correction per (deg*sec) of accumulated error.
-     * Python's own shipped default is 0.0 (off), but this repo's comparison testing found
-     * 0.3 cut RMS tracking error roughly in half to two-thirds versus Kp alone -- start from
-     * that tested value, not the off-by-default Python CLI default, and re-tune on hardware.
+     * 2.5 is the best value found so far on the clip actually bundled for the app
+     * (python/baile_pendulo.mp4's detected+corrected+polished track), tested together
+     * with MIN_RATE/MAX_RATE = 0.70/1.30 below -- the rate bounds genuinely in effect,
+     * not Python's wider 0.25-3.0 default. (An earlier, since-superseded round tested
+     * under those wider bounds found Ki=0 best; a narrower rate range leaves much less
+     * room for the P-term alone to catch up, so it needs more I-term help.) RMS error
+     * dropped from 11.8deg at Ki=0 to 5.96deg at Ki=2.5; pushing Ki past ~3.0 starts
+     * giving it back (persistent bias grows, then RMS rises again -- classic integral
+     * windup onset even with the I_LIMIT anti-windup clamp below). Re-tune on hardware,
+     * and re-tune again if MIN_RATE/MAX_RATE/MAX_ACCEL_*_PER_FRAME below ever change --
+     * this value is not independent of those.
      */
-    const val KI = 0.3f
+    const val KI = 2.5f
 
     /**
      * Derivative gain, dimensionless. Left at 0 (off): python/pendulum_sim_process.md
@@ -37,15 +45,25 @@ object PendulumTuning {
     /** Anti-windup clamp on the accumulated integral error, deg*sec. */
     const val I_LIMIT = 15.0
 
-    /** Playback speed multiplier bounds. Tightened from Python's 0.25-3.0 pending an
-     * on-device sweep of audio/decoder quality at extreme speeds -- see the plan's notes
-     * on MediaPlayer.PlaybackParams behavior. */
-    const val MIN_RATE = 0.5f
-    const val MAX_RATE = 2.0f
+    /** Playback speed multiplier bounds -- matches the range last validated in
+     * pendulum_sim.py (--min-rate 0.70 --max-rate 1.30), tighter than Python's own
+     * 0.25-3.0 default pending an on-device sweep of audio/decoder quality at more
+     * extreme speeds. Keep this in sync with whatever --min-rate/--max-rate the
+     * simulation was last run with -- a mismatch here means the app can legally pick
+     * rates the simulation never validated. */
+    const val MIN_RATE = 0.70f
+    const val MAX_RATE = 1.30f
 
     /** Max change in playback rate per *frame* of the source video (Python units) --
-     * multiply by the loaded timeline's fps to get a per-second slew limit at runtime. */
-    const val MAX_ACCEL_PER_FRAME = 0.04
+     * multiply by the loaded timeline's fps to get a per-second slew limit at runtime.
+     * Matches python/pendulum_sim.py's own --max-accel (slowing down) / --max-accel-up
+     * (speeding back up, faster, for quicker recovery after a dip) split, which tested
+     * best under MIN_RATE/MAX_RATE = 0.70/1.30 below (RMS 11.8deg, vs 13.4deg for an
+     * equal-both-directions 0.08/0.08 under those same bounds -- a different, wider-
+     * rate-bounds test once favored the symmetric 0.08/0.08, but that result doesn't
+     * hold under the rate bounds actually in effect here; see KI's comment above). */
+    const val MAX_ACCEL_DOWN_PER_FRAME = 0.04
+    const val MAX_ACCEL_UP_PER_FRAME = 0.08
 
     /** Local slope (deg per source-frame) below which the signal is treated as flat/no
      * reliable local direction -- multiply by fps for the per-second runtime threshold. */

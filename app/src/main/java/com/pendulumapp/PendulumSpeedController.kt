@@ -39,7 +39,8 @@ class PendulumSpeedController(
     private val iLimit: Double = PendulumTuning.I_LIMIT,
     private val minRate: Float = PendulumTuning.MIN_RATE,
     private val maxRate: Float = PendulumTuning.MAX_RATE,
-    private val maxAccelPerFrame: Double = PendulumTuning.MAX_ACCEL_PER_FRAME,
+    private val maxAccelDownPerFrame: Double = PendulumTuning.MAX_ACCEL_DOWN_PER_FRAME,
+    private val maxAccelUpPerFrame: Double = PendulumTuning.MAX_ACCEL_UP_PER_FRAME,
     private val minSlopeDegPerFrame: Double = PendulumTuning.MIN_SLOPE_DEG_PER_FRAME,
     private val tickIntervalMs: Long = PendulumTuning.TICK_INTERVAL_MS
 ) {
@@ -62,7 +63,8 @@ class PendulumSpeedController(
     // Python's MAX_ACCEL/MIN_SLOPE_DEG are expressed per source-*frame*; re-derive them
     // per *second* here using the loaded video's actual fps, since this loop runs on a
     // real-time timer, not a frame loop.
-    private val maxAccelPerSec = maxAccelPerFrame * timeline.fps
+    private val maxAccelDownPerSec = maxAccelDownPerFrame * timeline.fps
+    private val maxAccelUpPerSec = maxAccelUpPerFrame * timeline.fps
     private val minSlopeDegPerSec = minSlopeDegPerFrame * timeline.fps
 
     private var rate = 1.0f
@@ -130,8 +132,9 @@ class PendulumSpeedController(
             desiredRate = desiredDRealDt / sample.localSlopePerSec
         }
 
-        val maxStep = (maxAccelPerSec * dt).toFloat()
-        rate += (desiredRate.toFloat() - rate).coerceIn(-maxStep, maxStep)
+        val maxStepDown = (maxAccelDownPerSec * dt).toFloat()
+        val maxStepUp = (maxAccelUpPerSec * dt).toFloat()
+        rate += (desiredRate.toFloat() - rate).coerceIn(-maxStepDown, maxStepUp)
         rate = rate.coerceIn(minRate, maxRate)
 
         applySpeed(rate)

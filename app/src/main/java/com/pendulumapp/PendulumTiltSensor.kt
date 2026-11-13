@@ -27,9 +27,9 @@ import kotlin.math.atan2
  *
  * AXIS CALIBRATION -- confirmed from an on-device log (see python/plot_debug_log.py's raw
  * gravity-axis summary), not guessed:
- *   gravityX: mean +9.38, spread 1.64  -> near +-9.8 at rest: this is the DOWN axis
- *   gravityY: mean -0.14, spread 8.73  -> by far the largest swing: this is the SWING axis
- *   gravityZ: mean -0.16, spread 0.54  -> flat/noise: irrelevant
+ *   gravityX: mean -9.32, spread 9.79  -> near +-9.8 at rest: this is the DOWN axis
+ *   gravityY: by far the largest swing (+-4.5, i.e. a normal ~27deg tilt): the SWING axis
+ *   gravityZ: flat/noise: irrelevant
  * i.e. the phone is mounted with its screen roughly *vertical* (gravity sits on device X at
  * rest), not flat as this class originally assumed (it shipped assuming device Z was "down",
  * which matches a flat-on-a-table mounting, not an upright swinging one). [downAxisIndex]/
@@ -39,22 +39,36 @@ import kotlin.math.atan2
  * those two -- previously this read gyroX unconditionally, which was wrong for the same
  * reason the down axis was wrong.
  *
- * [invertSign] RE-VERIFIED after the axis fix above, and flipped: changing which raw axis
- * angleDeg is computed from (down axis Z -> X) changes the effective handedness of the
- * measured angle, so the correct sign changed too, as expected. Confirmed from a real log
- * (see python/plot_debug_log.py / the correlation check it's based on): with invertSign=true,
- * target and realHere were WEAKLY ANTI-correlated (~-0.3) -- the controller was pushing the
- * wrong direction on average, not just failing to converge. With invertSign=false, that
- * relationship flips to weakly positive, the right sign (further tuning may still be needed
- * for strength of tracking, but the *direction* is now correct). If the mounting changes
- * again, re-check this the same way: pull a log, correlate `targetDeg` against `realHereDeg`
- * -- it should come out positive, not negative. python/pendulum_sim_process.md section 6
- * describes what "doubling instead of compensating" (i.e. the sign backwards) looks like.
+ * [downAxisSign] -- an *earlier* calibration (different mounting) found gravityX read
+ * *positive* (+9.38) at rest; this mounting reads *negative* (-9.32), same magnitude and
+ * same axis, but flipped -- i.e. the phone is now mounted rotated ~180deg from before about
+ * (roughly) the swing axis. atan2(swing, down) needs `down` positive at rest to put angle≈0
+ * there (as the original +9.38 calibration had for free); with a negative-at-rest down axis
+ * and no correction, the "zero crossing" lands near +-180deg instead of 0, so the measured
+ * angle wraps around +-180 every swing instead of oscillating around 0 -- confirmed from a
+ * real log showing exactly that (liveAngleDeg sweeping the full +-180 range while the raw
+ * gravity components themselves showed only a normal ~27deg physical swing). downAxisSign=-1
+ * undoes that flip (multiplies the raw down component before atan2, so a negative-at-rest
+ * axis still produces angle≈0 at rest). If the mounting changes again: pull a log, check the
+ * new DOWN axis's sign at rest in python/plot_debug_log.py's raw-gravity-axis summary, and
+ * set downAxisSign to +1 (reads positive) or -1 (reads negative) to match.
+ *
+ * [invertSign] separately governs the measured angle's overall handedness (mirrored vs. not),
+ * independent of the down-axis zero-reference fixed by [downAxisSign] above -- confirmed from
+ * a real log (see python/plot_debug_log.py / the correlation check it's based on): with
+ * invertSign=true, target and realHere were WEAKLY ANTI-correlated (~-0.3) -- the controller
+ * was pushing the wrong direction on average, not just failing to converge. With
+ * invertSign=false, that relationship flips to weakly positive, the right sign. Re-verify
+ * this again (separately from downAxisSign) any time the mounting changes: pull a log,
+ * correlate `targetDeg` against `realHereDeg` -- it should come out positive, not negative.
+ * python/pendulum_sim_process.md section 6 describes what "doubling instead of compensating"
+ * (i.e. the sign backwards) looks like.
  */
 class PendulumTiltSensor(
     context: Context,
     private val downAxisIndex: Int = 0,   // gravityX: confirmed "down" at rest, see class doc
     private val swingAxisIndex: Int = 1,  // gravityY: confirmed swing axis, see class doc
+    private val downAxisSign: Int = -1,   // this mounting's down axis reads negative at rest
     private val invertSign: Boolean = false
 ) : SensorEventListener {
 
@@ -113,7 +127,7 @@ class PendulumTiltSensor(
                 gravityZ = event.values[2]
 
                 val swingComponent = event.values[swingAxisIndex]
-                val downComponent = event.values[downAxisIndex]
+                val downComponent = downAxisSign * event.values[downAxisIndex]
                 val raw = Math.toDegrees(atan2(swingComponent.toDouble(), downComponent.toDouble()))
                 angleDeg = (sign * raw).toFloat()
                 hasAngleReading = true
